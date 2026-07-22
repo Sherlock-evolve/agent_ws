@@ -1,7 +1,12 @@
 import os
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    message_chunk_to_message,
+)
 from langchain_openai import ChatOpenAI
 
 from tools import list_files, read_file
@@ -42,15 +47,36 @@ while True:
 
     messages.append(HumanMessage(content=question))
 
+    print("\nAI：", end="", flush=True)
+    cursor_at_line_start = False
     answered = False
+
     for _ in range(MAX_AGENT_LOOPS):
-        response = model_with_tools.invoke(messages)
+        response_chunk = None
+
+        for chunk in model_with_tools.stream(messages):
+            if chunk.content:
+                print(chunk.content, end="", flush=True)
+                cursor_at_line_start = chunk.content.endswith("\n")
+
+            if response_chunk is None:
+                response_chunk = chunk
+            else:
+                response_chunk = response_chunk + chunk
+
+        response = message_chunk_to_message(response_chunk)
         messages.append(response)
 
         if not response.tool_calls:
-            print(f"\nAI：{response.content}")
+            if not cursor_at_line_start:
+                print()
+                cursor_at_line_start = True
             answered = True
             break
+
+        if not cursor_at_line_start:
+            print()
+            cursor_at_line_start = True
 
         for tool_call in response.tool_calls:
             tool_name = tool_call["name"]
@@ -70,5 +96,7 @@ while True:
             )
 
     if not answered:
-        print(f"\nAI：Agent 循环达到 {MAX_AGENT_LOOPS} 次上限，已停止。")
+        if not cursor_at_line_start:
+            print()
+        print(f"[系统] Agent 循环达到 {MAX_AGENT_LOOPS} 次上限，已停止。")
         continue
