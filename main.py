@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
-from tools import read_note
+from tools import list_files, read_file
 
 
 load_dotenv()
@@ -15,14 +15,19 @@ model = ChatOpenAI(
     base_url=os.getenv("ZHIPU_BASE_URL"),
     temperature=0.7,
 )
-model_with_tools = model.bind_tools([read_note])
-tools_by_name = {read_note.name: read_note}
+tools = [list_files, read_file]
+tools_by_name = {tool.name: tool for tool in tools}
+model_with_tools = model.bind_tools(tools)
 
 MAX_AGENT_LOOPS = 5
 
 messages = [
     SystemMessage(
-        content="你是一位人工智能老师，请用通俗、准确的方式回答。"
+        content=(
+            "你是一位人工智能老师，也是当前项目的工作区助手。"
+            "需要了解项目文件时，请使用工具获取真实信息，不要猜测。"
+            "请用通俗、准确的方式回答。"
+        )
     )
 ]
 
@@ -49,10 +54,13 @@ while True:
 
         for tool_call in response.tool_calls:
             tool_name = tool_call["name"]
-            selected_tool = tools_by_name[tool_name]
-
             print(f"[工具调用] {tool_name}")
-            tool_result = selected_tool.invoke(tool_call["args"])
+
+            try:
+                selected_tool = tools_by_name[tool_name]
+                tool_result = selected_tool.invoke(tool_call["args"])
+            except Exception as error:
+                tool_result = f"工具执行失败：{error}"
 
             messages.append(
                 ToolMessage(
@@ -63,4 +71,4 @@ while True:
 
     if not answered:
         print(f"\nAI：Agent 循环达到 {MAX_AGENT_LOOPS} 次上限，已停止。")
-        break
+        continue
