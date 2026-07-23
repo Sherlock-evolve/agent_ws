@@ -1,7 +1,12 @@
 import json
+from collections.abc import Generator, Iterator
+from copy import deepcopy
 from dataclasses import dataclass, field
+from threading import Lock
+from typing import Literal
 
 from langchain_core.messages import (
+    AIMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
@@ -16,6 +21,62 @@ SYSTEM_PROMPT = (
 )
 
 
+@dataclass(frozen=True)
+class TokenEvent:
+    text: str
+
+
+@dataclass(frozen=True)
+class ToolCallEvent:
+    tool_call_id: str
+    step: int
+    name: str
+    args: dict
+
+
+@dataclass(frozen=True)
+class ToolResultEvent:
+    tool_call_id: str
+    name: str
+    status: Literal["success", "error", "skipped"]
+    character_count: int
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class SystemEvent:
+    message: str
+
+
+AgentEvent = TokenEvent | ToolCallEvent | ToolResultEvent | SystemEvent
+
+
+class _FrozenDict(dict):
+    def _immutable(self, *args, **kwargs):
+        raise TypeError("事件参数不可修改")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
+def _freeze(value):
+    if isinstance(value, dict):
+        return _FrozenDict({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze(item) for item in value)
+    return value
+
+
 @dataclass
 class _TurnState:
     tool_call_count: int = 0
@@ -23,25 +84,15 @@ class _TurnState:
     tool_budget_exhausted: bool = False
 
 
-@dataclass(frozen=True)
-class AgentEvent:
-    kind: str
-    text: str | None = None
-    step: int | None = None
-    tool_name: str | None = None
-    args_text: str | None = None
-    succeeded: bool | None = None
-    result_length: int | None = None
-
-
 class WorkspaceAgent:
+    """单会话 Agent；同一实例同一时间只允许运行一个事件流。"""
+
     def __init__(
         self,
         model,
         tools,
         max_agent_loops=5,
         max_tool_calls=8,
-        event_handler=None,
     ):
         self.model = model
         self.tools = list(tools)
@@ -50,11 +101,21 @@ class WorkspaceAgent:
         self.tools_by_name = {tool.name: tool for tool in self.tools}
         self.model_with_tools = self.model.bind_tools(self.tools)
         self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
-        self.event_handler = event_handler
+        self._turn_lock = Lock()
 
-    def run_turn(self, question: str) -> None:
-        self.messages.append(HumanMessage(content=question))
+    def stream_turn(self, question: str) -> Iterator[AgentEvent]:
+        """运行一轮并产生事件；提前停止消费时应关闭返回的生成器。"""
+        if not self._turn_lock.acquire(blocking=False):
+            raise RuntimeError("同一 WorkspaceAgent 不能同时运行多个对话轮次")
 
+        try:
+            yield from self._run_turn_transaction(question)
+        finally:
+            self._turn_lock.release()
+
+    def _run_turn_transaction(self, question: str) -> Iterator[AgentEvent]:
+        working_messages = list(self.messages)
+        working_messages.append(HumanMessage(content=question))
         state = _TurnState()
         answered = False
         task_stopped = False
@@ -65,49 +126,57 @@ class WorkspaceAgent:
                 and not state.tool_budget_exhausted
             )
             active_model = self.model_with_tools if tools_allowed else self.model
-            response = self._stream_response(active_model)
+            response = yield from self._stream_response(
+                active_model,
+                working_messages,
+            )
 
             if response is None:
-                self._emit(
-                    AgentEvent(
-                        kind="system",
-                        text="模型未返回任何消息，当前任务已停止。",
-                    )
+                yield SystemEvent(
+                    message="模型未返回任何消息，当前任务已停止。"
                 )
                 task_stopped = True
                 break
 
-            self.messages.append(response)
+            working_messages.append(response)
 
             if not response.tool_calls:
+                self.messages = working_messages
                 answered = True
                 break
 
             for tool_call in response.tool_calls:
-                self._execute_tool_call(
+                yield from self._execute_tool_call(
                     tool_call=tool_call,
                     step=step,
                     tools_allowed=tools_allowed,
                     state=state,
+                    working_messages=working_messages,
                 )
 
         if not answered and not task_stopped:
-            self._emit(
-                AgentEvent(
-                    kind="system",
-                    text=(
-                        f"Agent 循环达到 {self.max_agent_loops} 次上限，"
-                        "已停止。"
-                    ),
+            yield SystemEvent(
+                message=(
+                    f"Agent 循环达到 {self.max_agent_loops} 次上限，"
+                    "已停止。"
                 )
             )
 
-    def _stream_response(self, active_model):
+    def _stream_response(
+        self,
+        active_model,
+        working_messages: list,
+    ) -> Generator[AgentEvent, None, AIMessage | None]:
         response_chunk = None
 
-        for chunk in active_model.stream(self.messages):
-            if chunk.content:
-                self._emit(AgentEvent(kind="text_delta", text=chunk.content))
+        for chunk in active_model.stream(working_messages):
+            if isinstance(chunk.content, str):
+                text = chunk.content
+            else:
+                text = chunk.text
+
+            if text:
+                yield TokenEvent(text=text)
 
             if response_chunk is None:
                 response_chunk = chunk
@@ -125,47 +194,59 @@ class WorkspaceAgent:
         step: int,
         tools_allowed: bool,
         state: _TurnState,
-    ) -> None:
+        working_messages: list,
+    ) -> Iterator[AgentEvent]:
+        tool_call_id = tool_call["id"]
         tool_name = tool_call["name"]
+        internal_args = deepcopy(tool_call["args"])
+        event_args = _freeze(deepcopy(internal_args))
         signature = (
             tool_name,
             json.dumps(
-                tool_call["args"],
+                internal_args,
                 ensure_ascii=False,
                 sort_keys=True,
             ),
         )
-        args_text = signature[1]
-        self._emit(
-            AgentEvent(
-                kind="tool_call",
-                step=step,
-                tool_name=tool_name,
-                args_text=args_text,
-            )
+        yield ToolCallEvent(
+            tool_call_id=tool_call_id,
+            step=step,
+            name=tool_name,
+            args=event_args,
         )
 
         if not tools_allowed:
-            self._emit(
-                AgentEvent(
-                    kind="tool_skip",
-                    text="当前轮次禁止调用工具",
-                )
-            )
+            detail = "当前轮次禁止调用工具"
             self._append_tool_message(
+                messages=working_messages,
                 content=(
                     "当前轮次不允许调用工具，本次调用未执行。"
                     "请根据已有信息直接回答。"
                 ),
-                tool_call_id=tool_call["id"],
+                tool_call_id=tool_call_id,
+            )
+            yield ToolResultEvent(
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                status="skipped",
+                character_count=0,
+                detail=detail,
             )
             return
 
         if signature in state.seen_tool_calls:
-            self._emit(AgentEvent(kind="tool_skip", text="重复调用"))
+            detail = "重复调用"
             self._append_tool_message(
+                messages=working_messages,
                 content="重复工具调用已跳过，请使用之前相同工具调用的结果。",
-                tool_call_id=tool_call["id"],
+                tool_call_id=tool_call_id,
+            )
+            yield ToolResultEvent(
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                status="skipped",
+                character_count=0,
+                detail=detail,
             )
             return
 
@@ -173,13 +254,21 @@ class WorkspaceAgent:
 
         if state.tool_call_count >= self.max_tool_calls:
             state.tool_budget_exhausted = True
-            self._emit(AgentEvent(kind="tool_skip", text="工具预算已耗尽"))
+            detail = "工具预算已耗尽"
             self._append_tool_message(
+                messages=working_messages,
                 content=(
                     "工具预算已耗尽，本次调用未执行。"
                     "请根据已有信息回答。"
                 ),
-                tool_call_id=tool_call["id"],
+                tool_call_id=tool_call_id,
+            )
+            yield ToolResultEvent(
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                status="skipped",
+                character_count=0,
+                detail=detail,
             )
             return
 
@@ -189,34 +278,33 @@ class WorkspaceAgent:
 
         try:
             selected_tool = self.tools_by_name[tool_name]
-            tool_result_text = str(selected_tool.invoke(tool_call["args"]))
-            tool_succeeded = True
+            tool_result_text = str(selected_tool.invoke(internal_args))
+            tool_status = "success"
         except Exception as error:
             tool_result_text = f"工具执行失败：{error}"
-            tool_succeeded = False
+            tool_status = "error"
 
-        result_status = "成功" if tool_succeeded else "失败"
-        self._emit(
-            AgentEvent(
-                kind="tool_result",
-                text=result_status,
-                succeeded=tool_succeeded,
-                result_length=len(tool_result_text),
-            )
-        )
         self._append_tool_message(
+            messages=working_messages,
             content=tool_result_text,
-            tool_call_id=tool_call["id"],
+            tool_call_id=tool_call_id,
+        )
+        yield ToolResultEvent(
+            tool_call_id=tool_call_id,
+            name=tool_name,
+            status=tool_status,
+            character_count=len(tool_result_text),
         )
 
-    def _append_tool_message(self, content: str, tool_call_id: str) -> None:
-        self.messages.append(
+    @staticmethod
+    def _append_tool_message(
+        messages: list,
+        content: str,
+        tool_call_id: str,
+    ) -> None:
+        messages.append(
             ToolMessage(
                 content=content,
                 tool_call_id=tool_call_id,
             )
         )
-
-    def _emit(self, event: AgentEvent) -> None:
-        if self.event_handler is not None:
-            self.event_handler(event)
