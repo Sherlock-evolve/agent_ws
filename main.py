@@ -1,10 +1,12 @@
 import argparse
 import json
 import os
+from collections.abc import Callable
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
+import session_store
 from agent import WorkspaceAgent
 from contracts import (
     AgentEvent,
@@ -38,6 +40,14 @@ STATUS_LABELS = {
     "error": "失败",
 }
 EXIT_COMMANDS = {"exit", "quit", "退出"}
+HELP_TEXT = """可用命令：
+  :session              显示当前会话状态
+  :sessions             按名称列出会话
+  :switch <session_id>  切换或新建会话
+  :delete <session_id>  删除非当前会话
+  :retry                重试保存未保存状态
+  :help                 显示此帮助
+  exit / quit / 退出    退出程序"""
 
 
 class _ExitRequested(Exception):
@@ -177,7 +187,154 @@ def _exit_status(
     return 130 if interrupted else 0
 
 
-def run_cli(session: PersistentSession) -> int:
+def _print_help() -> None:
+    print(HELP_TEXT)
+
+
+def _valid_session_id(session_id: str) -> bool:
+    return session_store.SESSION_ID_PATTERN.fullmatch(session_id) is not None
+
+
+def _show_current_session(session: PersistentSession) -> None:
+    dirty_state = "是" if session.dirty else "否"
+    print(f"[会话] 当前：{session.session_id}（dirty：{dirty_state}）")
+
+
+def _show_sessions(session: PersistentSession) -> None:
+    try:
+        session_ids = set(session_store.list_sessions())
+    except session_store.SessionStoreError as error:
+        print(f"[会话列表失败] {error}")
+        return
+
+    session_ids.add(session.session_id)
+    print("[会话列表]")
+    for session_id in sorted(session_ids):
+        if session_id == session.session_id:
+            dirty_label = "，dirty" if session.dirty else ""
+            print(f"* {session_id}（当前{dirty_label}）")
+        else:
+            print(f"  {session_id}")
+
+
+def _retry_save(session: PersistentSession) -> None:
+    if not session.dirty:
+        print("[会话] 当前没有未保存状态")
+        return
+
+    try:
+        session.flush()
+    except PersistentSessionSaveError as error:
+        print(f"[保存失败] {error}")
+    except Exception as error:
+        print(f"[保存失败] {error}")
+    else:
+        print(f"[会话] 重试保存成功：{session.session_id}")
+
+
+def _switch_session(
+    session: PersistentSession,
+    session_id: str,
+    agent_factory: Callable[[], WorkspaceAgent],
+) -> PersistentSession:
+    if session.dirty:
+        print("[会话] 存在未保存状态，不能切换会话；请先输入 :retry")
+        return session
+    if session_id == session.session_id:
+        print(f"[会话] 已经位于：{session_id}")
+        return session
+
+    try:
+        candidate = PersistentSession.open(session_id, agent_factory)
+    except Exception as error:
+        print(f"[切换失败] {error}")
+        return session
+
+    print(f"[会话] 已切换：{session_id}")
+    return candidate
+
+
+def _delete_session(
+    session: PersistentSession,
+    session_id: str,
+) -> None:
+    if session.dirty:
+        print("[会话] 存在未保存状态，不能删除会话；请先输入 :retry")
+        return
+    if session_id == session.session_id:
+        print("[会话] 不能删除当前会话")
+        return
+
+    try:
+        answer = input(f"确认删除会话 {session_id}？[y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        print("[会话] 已取消删除")
+        return
+
+    if answer.strip().lower() not in {"y", "yes"}:
+        print("[会话] 已取消删除")
+        return
+
+    try:
+        session_store.delete(session_id)
+    except session_store.SessionStoreError as error:
+        print(f"[删除失败] {error}")
+    except Exception as error:
+        print(f"[删除失败] {error}")
+    else:
+        print(f"[会话] 已删除：{session_id}")
+
+
+def _handle_command(
+    session: PersistentSession,
+    command_text: str,
+    agent_factory: Callable[[], WorkspaceAgent],
+) -> tuple[bool, PersistentSession]:
+    if not command_text.startswith(":"):
+        return False, session
+
+    parts = command_text.split()
+    command = parts[0].lower()
+    arguments = parts[1:]
+
+    if command == ":session" and not arguments:
+        _show_current_session(session)
+    elif command == ":sessions" and not arguments:
+        _show_sessions(session)
+    elif command == ":retry" and not arguments:
+        _retry_save(session)
+    elif command == ":switch" and len(arguments) == 1:
+        session_id = arguments[0]
+        if not _valid_session_id(session_id):
+            _print_help()
+        else:
+            session = _switch_session(
+                session,
+                session_id,
+                agent_factory,
+            )
+    elif command == ":delete" and len(arguments) == 1:
+        session_id = arguments[0]
+        if not _valid_session_id(session_id):
+            _print_help()
+        else:
+            _delete_session(session, session_id)
+    elif command == ":help" and not arguments:
+        _print_help()
+    else:
+        _print_help()
+
+    return True, session
+
+
+def run_cli(
+    session: PersistentSession,
+    agent_factory: Callable[[], WorkspaceAgent] | None = None,
+) -> int:
+    if agent_factory is None:
+        agent_factory = create_workspace_agent
+
     try:
         while True:
             question = input("\n你：").strip()
@@ -188,26 +345,16 @@ def run_cli(session: PersistentSession) -> int:
             if not question:
                 continue
 
-            if question == ":retry":
-                if not session.dirty:
-                    print("[会话] 当前没有未保存状态")
-                    continue
-                try:
-                    session.flush()
-                except PersistentSessionSaveError as error:
-                    print(f"[保存失败] {error}")
-                except Exception as error:
-                    print(f"[保存失败] {error}")
-                else:
-                    print(f"[会话] 重试保存成功：{session.session_id}")
+            handled, session = _handle_command(
+                session,
+                question,
+                agent_factory,
+            )
+            if handled:
                 continue
 
             if session.dirty:
                 print("[会话] 存在未保存状态，请先输入 :retry 或退出")
-                continue
-
-            if question.startswith(":"):
-                print(f"[命令] 未知命令：{question}")
                 continue
 
             _drive_turn(session, question)
@@ -245,7 +392,7 @@ def main(argv=None) -> int:
         print(f"[启动失败] {error}")
         return 2
 
-    return run_cli(session)
+    return run_cli(session, create_workspace_agent)
 
 
 if __name__ == "__main__":

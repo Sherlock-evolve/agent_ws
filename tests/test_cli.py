@@ -1,11 +1,16 @@
 from collections import deque
 
-from langchain_core.messages import AIMessageChunk, HumanMessage
+from langchain_core.messages import (
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+)
 from langchain_core.tools import tool
 
 import main as cli
 import session_store
 from agent import WorkspaceAgent
+from persistent_session import PersistentSession
 
 
 CLI_TOOL_EXECUTIONS = []
@@ -327,3 +332,262 @@ def test_cli_closes_active_approval_stream_on_exit_signals(
         assert list(agent.stream_turn("验证锁释放")) == [
             cli.TokenEvent(text="锁已释放。")
         ]
+
+
+def test_cli_shows_current_and_sorted_session_list(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    snapshot = WorkspaceAgent(
+        model=ScriptedModel([]),
+        tools=[],
+    ).export_snapshot()
+    session_store.save("zeta", snapshot)
+    session_store.save("alpha", snapshot)
+
+    current = PersistentSession(
+        "middle",
+        WorkspaceAgent(model=ScriptedModel([]), tools=[]),
+    )
+    current._dirty = True
+    set_inputs(monkeypatch, [":session", ":sessions", "exit"])
+
+    status = cli.run_cli(
+        current,
+        lambda: WorkspaceAgent(model=ScriptedModel([]), tools=[]),
+    )
+    output = capsys.readouterr().out
+
+    assert status == 1
+    assert "[会话] 当前：middle（dirty：是）" in output
+    assert "* middle（当前，dirty）" in output
+    list_output = output.split("[会话列表]", 1)[1]
+    assert (
+        list_output.index("alpha")
+        < list_output.index("middle")
+        < list_output.index("zeta")
+    )
+
+
+def test_cli_switches_existing_and_new_sessions_with_independent_agents(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    saved_agent = WorkspaceAgent(
+        model=ScriptedModel(
+            [[AIMessageChunk(content="旧会话回答")]]
+        ),
+        tools=[],
+    )
+    list(saved_agent.stream_turn("旧会话问题"))
+    session_store.save("saved", saved_agent.export_snapshot())
+
+    original_agent = WorkspaceAgent(
+        model=ScriptedModel([]),
+        tools=[],
+    )
+    original = PersistentSession("original", original_agent)
+    created_agents = []
+
+    def agent_factory():
+        agent = WorkspaceAgent(model=ScriptedModel([]), tools=[])
+        created_agents.append(agent)
+        return agent
+
+    set_inputs(
+        monkeypatch,
+        [":switch saved", ":switch fresh", "exit"],
+    )
+
+    status = cli.run_cli(original, agent_factory)
+    output = capsys.readouterr().out
+
+    assert status == 0
+    assert "[会话] 已切换：saved" in output
+    assert "[会话] 已切换：fresh" in output
+    assert len(created_agents) == 2
+    assert [
+        message.content
+        for message in created_agents[0].messages
+        if isinstance(message, HumanMessage)
+    ] == ["旧会话问题"]
+    assert [type(message) for message in created_agents[1].messages] == [
+        SystemMessage
+    ]
+    assert original_agent is not created_agents[0]
+    assert created_agents[0] is not created_agents[1]
+
+
+def test_cli_failed_switch_keeps_current_session(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    store_root = tmp_path / ".agent_sessions"
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        store_root,
+    )
+    store_root.mkdir(mode=0o700)
+    corrupt_path = store_root / "broken.json"
+    corrupt_path.write_text("{broken", encoding="utf-8")
+    corrupt_bytes = corrupt_path.read_bytes()
+
+    current_model = ScriptedModel(
+        [[AIMessageChunk(content="仍由原会话回答")]]
+    )
+    current_agent = WorkspaceAgent(model=current_model, tools=[])
+    current = PersistentSession("current", current_agent)
+    candidate_factory_calls = []
+
+    def candidate_factory():
+        candidate_factory_calls.append("called")
+        return WorkspaceAgent(model=ScriptedModel([]), tools=[])
+
+    set_inputs(
+        monkeypatch,
+        [":switch broken", "继续原会话", "exit"],
+    )
+
+    status = cli.run_cli(current, candidate_factory)
+    output = capsys.readouterr().out
+
+    assert status == 0
+    assert "[切换失败]" in output
+    assert "仍由原会话回答" in output
+    assert candidate_factory_calls == []
+    assert current_model.call_log == [True]
+    assert current_agent.messages[-2].content == "继续原会话"
+    assert session_store.load("current") == current_agent.export_snapshot()
+    assert corrupt_path.read_bytes() == corrupt_bytes
+
+
+def test_cli_delete_requires_confirmation_and_never_deletes_current(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    agent = WorkspaceAgent(model=ScriptedModel([]), tools=[])
+    snapshot = agent.export_snapshot()
+    session_store.save("current", snapshot)
+    session_store.save("target", snapshot)
+    current = PersistentSession("current", agent)
+    inputs = deque(
+        [
+            ":delete target",
+            EOFError(),
+            ":delete target",
+            KeyboardInterrupt(),
+            ":delete target",
+            "n",
+            ":delete target",
+            "yes",
+            ":delete current",
+            "exit",
+        ]
+    )
+
+    def scripted_input(prompt=""):
+        value = inputs.popleft()
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    monkeypatch.setattr("builtins.input", scripted_input)
+
+    status = cli.run_cli(
+        current,
+        lambda: WorkspaceAgent(model=ScriptedModel([]), tools=[]),
+    )
+    output = capsys.readouterr().out
+
+    assert status == 0
+    assert output.count("[会话] 已取消删除") == 3
+    assert "[会话] 已删除：target" in output
+    assert "[会话] 不能删除当前会话" in output
+    assert session_store.list_sessions() == ["current"]
+
+
+def test_cli_dirty_mode_blocks_mutations_and_bad_commands_show_help(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    snapshot = WorkspaceAgent(
+        model=ScriptedModel([]),
+        tools=[],
+    ).export_snapshot()
+    session_store.save("other", snapshot)
+
+    model = ScriptedModel([])
+    current = PersistentSession(
+        "current",
+        WorkspaceAgent(model=model, tools=[]),
+    )
+    current._dirty = True
+    factory_calls = []
+    delete_calls = []
+    real_delete = session_store.delete
+
+    def tracked_factory():
+        factory_calls.append("called")
+        return WorkspaceAgent(model=ScriptedModel([]), tools=[])
+
+    def tracked_delete(session_id):
+        delete_calls.append(session_id)
+        real_delete(session_id)
+
+    monkeypatch.setattr(session_store, "delete", tracked_delete)
+    set_inputs(
+        monkeypatch,
+        [
+            ":switch other",
+            ":delete other",
+            ":session",
+            ":sessions",
+            ":switch",
+            ":delete a b",
+            ":switch ../bad",
+            ":unknown",
+            ":help",
+            "不能发送给模型",
+            "exit",
+        ],
+    )
+
+    status = cli.run_cli(current, tracked_factory)
+    output = capsys.readouterr().out
+
+    assert status == 1
+    assert factory_calls == []
+    assert delete_calls == []
+    assert session_store.list_sessions() == ["other"]
+    assert model.call_log == []
+    assert "不能切换会话" in output
+    assert "不能删除会话" in output
+    assert "[会话] 当前：current（dirty：是）" in output
+    assert output.count("可用命令：") >= 5
+    assert "存在未保存状态，请先输入 :retry 或退出" in output
