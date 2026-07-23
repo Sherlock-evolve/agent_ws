@@ -1,4 +1,7 @@
+import difflib
 import os
+import stat
+import tempfile
 from pathlib import Path, PureWindowsPath
 
 from langchain_core.tools import tool
@@ -23,6 +26,8 @@ MAX_READ_LINES = 200
 MAX_READ_CHARACTERS = 20_000
 MAX_READ_BODY_CHARACTERS = 19_700
 MAX_LIST_ENTRIES = 200
+MAX_WRITE_PREVIEW_CHARACTERS = 8_000
+WRITE_PREVIEW_TRUNCATION_MARKER = "\n[预览已截断]"
 
 
 def _is_sensitive_name(name: str) -> bool:
@@ -70,6 +75,28 @@ def _resolve_workspace_path(path: str) -> Path:
         raise ValueError("不允许访问被忽略或敏感的路径")
 
     return resolved_path
+
+
+def _validate_write_content(content: str) -> bytes:
+    try:
+        encoded_content = content.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("写入内容不是有效的 UTF-8 文本") from error
+
+    if len(encoded_content) > MAX_FILE_SIZE_BYTES:
+        raise ValueError("写入内容超过 1 MB，拒绝写入")
+    return encoded_content
+
+
+def _resolve_write_target(path: str) -> Path:
+    file_path = _resolve_workspace_path(path)
+    if file_path.exists() and not file_path.is_file():
+        raise IsADirectoryError(f"不是文件：{path}")
+    if not file_path.parent.exists():
+        raise FileNotFoundError(f"父目录不存在：{file_path.parent}")
+    if not file_path.parent.is_dir():
+        raise NotADirectoryError(f"父路径不是目录：{file_path.parent}")
+    return file_path
 
 
 @tool
@@ -186,6 +213,84 @@ def read_file(
 
     result = "\n".join([*output_lines, *hints])
     return result[:MAX_READ_CHARACTERS]
+
+
+@tool
+def write_file(path: str, content: str) -> str:
+    """原子创建或更新项目内文本文件；写入前必须由 Agent 获得用户审批。"""
+    file_path = _resolve_write_target(path)
+    encoded_content = _validate_write_content(content)
+    file_exists = file_path.exists()
+    status = "更新" if file_exists else "创建"
+    existing_mode = (
+        stat.S_IMODE(file_path.stat().st_mode)
+        if file_exists
+        else None
+    )
+    temporary_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=file_path.parent,
+            prefix=f".{file_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(encoded_content)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+
+        if existing_mode is not None:
+            os.chmod(temporary_path, existing_mode)
+        os.replace(temporary_path, file_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+    return f"已{status} {path}，共 {len(content)} 个字符"
+
+
+@tool
+def preview_write_file(path: str, content: str) -> str:
+    """预览 write_file 将产生的统一 diff；不会修改文件。"""
+    file_path = _resolve_write_target(path)
+    _validate_write_content(content)
+
+    if file_path.exists():
+        if file_path.stat().st_size > MAX_FILE_SIZE_BYTES:
+            raise ValueError("原文件超过 1 MB，拒绝生成写入预览")
+        old_content = file_path.read_text(encoding="utf-8")
+    else:
+        old_content = ""
+
+    display_path = file_path.relative_to(WORKSPACE_ROOT).as_posix()
+    preview = "".join(
+        difflib.unified_diff(
+            old_content.splitlines(keepends=True),
+            content.splitlines(keepends=True),
+            fromfile=f"a/{display_path}",
+            tofile=f"b/{display_path}",
+        )
+    )
+    if not preview:
+        return "（文件内容无变化）"
+
+    if len(preview) > MAX_WRITE_PREVIEW_CHARACTERS:
+        body_limit = (
+            MAX_WRITE_PREVIEW_CHARACTERS
+            - len(WRITE_PREVIEW_TRUNCATION_MARKER)
+        )
+        preview = (
+            preview[:body_limit]
+            + WRITE_PREVIEW_TRUNCATION_MARKER
+        )
+    return preview
 
 
 @tool

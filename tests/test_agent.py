@@ -1,4 +1,5 @@
 import json
+import stat
 from collections import deque
 
 from langchain_core.messages import (
@@ -10,7 +11,10 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import tool
 
+import tools as workspace_tools
 from agent import (
+    ApprovalDecision,
+    ApprovalRequiredEvent,
     ContextTrimmedEvent,
     MemoryUpdatedEvent,
     SystemEvent,
@@ -222,6 +226,543 @@ def test_cancelled_stream_does_not_commit_history():
         AIMessage,
     ]
     assert list(model.responses) == []
+
+
+def test_approved_tool_call_executes_once():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("approved-call", "echo_test", '{"value":"approved"}'),
+            ),
+            [AIMessageChunk(content="已根据批准的结果回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        approval_required_tools={"echo_test"},
+    )
+
+    stream = agent.stream_turn("执行受控工具")
+    call_event = next(stream)
+    approval_event = next(stream)
+
+    assert isinstance(call_event, ToolCallEvent)
+    assert approval_event == ApprovalRequiredEvent(
+        tool_call_id="approved-call",
+        tool_name="echo_test",
+        args={"value": "approved"},
+    )
+
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id="approved-call",
+            approved=True,
+        )
+    )
+    remaining_events = list(stream)
+
+    assert isinstance(result_event, ToolResultEvent)
+    assert result_event.status == "success"
+    assert ECHO_EXECUTIONS == ["approved"]
+    assert remaining_events == [
+        TokenEvent(text="已根据批准的结果回答。")
+    ]
+    assert model.call_log == [True, True]
+
+
+def test_rejected_tool_call_is_skipped_and_model_continues():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("rejected-call", "echo_test", '{"value":"rejected"}'),
+            ),
+            [AIMessageChunk(content="工具未批准，继续回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        approval_required_tools={"echo_test"},
+    )
+
+    stream = agent.stream_turn("拒绝受控工具")
+    next(stream)
+    approval_event = next(stream)
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id=approval_event.tool_call_id,
+            approved=False,
+        )
+    )
+    remaining_events = list(stream)
+
+    tool_messages = [
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    ]
+    assert result_event.status == "skipped"
+    assert result_event.detail == "用户未批准"
+    assert ECHO_EXECUTIONS == []
+    assert len(tool_messages) == 1
+    assert "用户未批准" in tool_messages[0].content
+    assert tool_messages[0].content != ""
+    assert remaining_events == [
+        TokenEvent(text="工具未批准，继续回答。")
+    ]
+    assert model.call_log == [True, True]
+
+
+def test_mismatched_approval_id_is_rejected():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("expected-call", "echo_test", '{"value":"protected"}'),
+            ),
+            [AIMessageChunk(content="审批无效，继续回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        approval_required_tools={"echo_test"},
+    )
+
+    stream = agent.stream_turn("发送错误审批 ID")
+    next(stream)
+    next(stream)
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id="different-call",
+            approved=True,
+        )
+    )
+    remaining_events = list(stream)
+
+    assert result_event.status == "skipped"
+    assert result_event.detail == "审批调用 ID 不匹配"
+    assert ECHO_EXECUTIONS == []
+    assert remaining_events == [
+        TokenEvent(text="审批无效，继续回答。")
+    ]
+    tool_message = next(
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    )
+    assert "用户未批准" in tool_message.content
+
+
+def test_closing_while_waiting_for_approval_rolls_back_and_releases_lock():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("cancelled-approval", "echo_test", '{"value":"unsafe"}'),
+            ),
+            [AIMessageChunk(content="下一轮正常回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        approval_required_tools={"echo_test"},
+    )
+    original_history = agent.messages
+
+    stream = agent.stream_turn("等待审批后取消")
+    assert isinstance(next(stream), ToolCallEvent)
+    assert isinstance(next(stream), ApprovalRequiredEvent)
+
+    stream.close()
+
+    assert ECHO_EXECUTIONS == []
+    assert agent.messages is original_history
+    assert [type(message) for message in agent.messages] == [SystemMessage]
+
+    next_events = list(agent.stream_turn("下一轮"))
+
+    assert next_events == [TokenEvent(text="下一轮正常回答。")]
+    assert model.call_log == [True, True]
+    assert ECHO_EXECUTIONS == []
+    assert [
+        message.content
+        for message in agent.messages
+        if isinstance(message, HumanMessage)
+    ] == ["下一轮"]
+
+
+def test_approved_write_atomically_creates_file(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        workspace_tools,
+        "WORKSPACE_ROOT",
+        tmp_path.resolve(),
+    )
+    replace_calls = []
+    real_replace = workspace_tools.os.replace
+
+    def tracking_replace(source, destination):
+        replace_calls.append((source, destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(workspace_tools.os, "replace", tracking_replace)
+    content = "原子创建内容\n"
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "write-create",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {"path": "created.txt", "content": content},
+                        ensure_ascii=False,
+                    ),
+                ),
+            ),
+            [AIMessageChunk(content="文件已创建。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[workspace_tools.write_file],
+        approval_required_tools={workspace_tools.write_file.name},
+        approval_previewers={
+            workspace_tools.write_file.name:
+            workspace_tools.preview_write_file
+        },
+    )
+
+    stream = agent.stream_turn("创建文件")
+    assert isinstance(next(stream), ToolCallEvent)
+    approval_event = next(stream)
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id=approval_event.tool_call_id,
+            approved=True,
+        )
+    )
+    list(stream)
+
+    created_file = tmp_path / "created.txt"
+    assert result_event.status == "success"
+    assert created_file.read_text(encoding="utf-8") == content
+    assert len(replace_calls) == 1
+    temporary_path, destination_path = map(
+        workspace_tools.Path,
+        replace_calls[0],
+    )
+    assert temporary_path.parent == tmp_path
+    assert destination_path == created_file
+    assert not temporary_path.exists()
+    tool_message = next(
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    )
+    assert "已创建 created.txt" in tool_message.content
+    assert f"{len(content)} 个字符" in tool_message.content
+
+
+def test_approved_write_overwrites_file_with_correct_preview(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        workspace_tools,
+        "WORKSPACE_ROOT",
+        tmp_path.resolve(),
+    )
+    target_file = tmp_path / "note.txt"
+    target_file.write_text("旧内容\n保留行\n", encoding="utf-8")
+    new_content = "新内容\n保留行\n"
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "write-update",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {"path": "note.txt", "content": new_content},
+                        ensure_ascii=False,
+                    ),
+                ),
+            ),
+            [AIMessageChunk(content="文件已更新。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[workspace_tools.write_file],
+        approval_required_tools={workspace_tools.write_file.name},
+        approval_previewers={
+            workspace_tools.write_file.name:
+            workspace_tools.preview_write_file
+        },
+    )
+
+    stream = agent.stream_turn("更新文件")
+    next(stream)
+    approval_event = next(stream)
+
+    assert isinstance(approval_event, ApprovalRequiredEvent)
+    assert "--- a/note.txt" in approval_event.preview
+    assert "+++ b/note.txt" in approval_event.preview
+    assert "-旧内容" in approval_event.preview
+    assert "+新内容" in approval_event.preview
+
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id=approval_event.tool_call_id,
+            approved=True,
+        )
+    )
+    list(stream)
+
+    assert result_event.status == "success"
+    assert target_file.read_text(encoding="utf-8") == new_content
+    tool_message = next(
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    )
+    assert "已更新 note.txt" in tool_message.content
+
+
+def test_approved_write_preserves_existing_file_mode(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        workspace_tools,
+        "WORKSPACE_ROOT",
+        tmp_path.resolve(),
+    )
+    script_file = tmp_path / "run.sh"
+    script_file.write_text("#!/bin/sh\necho old\n", encoding="utf-8")
+    script_file.chmod(0o755)
+    new_content = "#!/bin/sh\necho new\n"
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "write-script",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {"path": "run.sh", "content": new_content}
+                    ),
+                ),
+            ),
+            [AIMessageChunk(content="脚本已更新。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[workspace_tools.write_file],
+        approval_required_tools={workspace_tools.write_file.name},
+        approval_previewers={
+            workspace_tools.write_file.name:
+            workspace_tools.preview_write_file
+        },
+    )
+
+    stream = agent.stream_turn("更新脚本")
+    next(stream)
+    approval_event = next(stream)
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id=approval_event.tool_call_id,
+            approved=True,
+        )
+    )
+    list(stream)
+
+    assert result_event.status == "success"
+    assert script_file.read_text(encoding="utf-8") == new_content
+    assert stat.S_IMODE(script_file.stat().st_mode) == 0o755
+
+
+def test_rejected_write_leaves_file_unchanged(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        workspace_tools,
+        "WORKSPACE_ROOT",
+        tmp_path.resolve(),
+    )
+    target_file = tmp_path / "protected.txt"
+    original_content = "保持不变\n"
+    target_file.write_text(original_content, encoding="utf-8")
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "write-rejected",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {
+                            "path": "protected.txt",
+                            "content": "不应写入\n",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ),
+            [AIMessageChunk(content="写入已取消。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[workspace_tools.write_file],
+        approval_required_tools={workspace_tools.write_file.name},
+        approval_previewers={
+            workspace_tools.write_file.name:
+            workspace_tools.preview_write_file
+        },
+    )
+
+    stream = agent.stream_turn("尝试覆盖文件")
+    next(stream)
+    approval_event = next(stream)
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id=approval_event.tool_call_id,
+            approved=False,
+        )
+    )
+    list(stream)
+
+    assert result_event.status == "skipped"
+    assert target_file.read_text(encoding="utf-8") == original_content
+
+
+def test_approved_write_still_rejects_traversal_and_sensitive_paths(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        workspace_tools,
+        "WORKSPACE_ROOT",
+        tmp_path.resolve(),
+    )
+    outside_file = tmp_path.parent / f"outside-{tmp_path.name}.txt"
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "write-traversal",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {
+                            "path": f"../{outside_file.name}",
+                            "content": "outside",
+                        }
+                    ),
+                ),
+                (
+                    "write-sensitive",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {"path": ".env", "content": "API_KEY=secret"}
+                    ),
+                ),
+            ),
+            [AIMessageChunk(content="非法写入均已拒绝。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[workspace_tools.write_file],
+        approval_required_tools={workspace_tools.write_file.name},
+    )
+
+    stream = agent.stream_turn("尝试非法写入")
+    assert isinstance(next(stream), ToolCallEvent)
+    first_approval = next(stream)
+    first_result = stream.send(
+        ApprovalDecision(
+            tool_call_id=first_approval.tool_call_id,
+            approved=True,
+        )
+    )
+    assert isinstance(next(stream), ToolCallEvent)
+    second_approval = next(stream)
+    second_result = stream.send(
+        ApprovalDecision(
+            tool_call_id=second_approval.tool_call_id,
+            approved=True,
+        )
+    )
+    list(stream)
+
+    assert first_result.status == "error"
+    assert second_result.status == "error"
+    assert not outside_file.exists()
+    assert not (tmp_path / ".env").exists()
+
+
+def test_write_preview_is_limited_and_tool_event_redacts_content(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        workspace_tools,
+        "WORKSPACE_ROOT",
+        tmp_path.resolve(),
+    )
+    content = "SECRET-CONTENT-LINE\n" * 600
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "write-preview",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {"path": "preview.txt", "content": content}
+                    ),
+                ),
+            ),
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[workspace_tools.write_file],
+        approval_required_tools={workspace_tools.write_file.name},
+        approval_previewers={
+            workspace_tools.write_file.name:
+            workspace_tools.preview_write_file
+        },
+    )
+
+    stream = agent.stream_turn("预览长文件")
+    call_event = next(stream)
+    approval_event = next(stream)
+
+    assert call_event.args["path"] == "preview.txt"
+    assert call_event.args["content"] == f"<{len(content)} characters>"
+    assert content not in json.dumps(call_event.args, ensure_ascii=False)
+    assert approval_event.args["content"] == (
+        f"<{len(content)} characters>"
+    )
+    assert "SECRET-CONTENT-LINE" in approval_event.preview
+    assert (
+        len(approval_event.preview)
+        <= workspace_tools.MAX_WRITE_PREVIEW_CHARACTERS
+    )
+    assert approval_event.preview.endswith(
+        workspace_tools.WRITE_PREVIEW_TRUNCATION_MARKER
+    )
+
+    stream.close()
+
+    assert not (tmp_path / "preview.txt").exists()
 
 
 def test_duplicate_tool_call_is_skipped():

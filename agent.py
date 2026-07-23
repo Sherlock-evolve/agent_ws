@@ -1,5 +1,5 @@
 import json
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator
 from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import Lock
@@ -21,6 +21,13 @@ SYSTEM_PROMPT = (
     "请用通俗、准确的方式回答。"
 )
 TOOL_RESULT_TRUNCATION_MARKER = "\n[工具结果已截断]"
+REDACTED_ARGUMENT_NAMES = {
+    "api_key",
+    "content",
+    "password",
+    "secret",
+    "token",
+}
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,20 @@ class ToolResultEvent:
 
 
 @dataclass(frozen=True)
+class ApprovalRequiredEvent:
+    tool_call_id: str
+    tool_name: str
+    args: dict
+    preview: str = ""
+
+
+@dataclass(frozen=True)
+class ApprovalDecision:
+    tool_call_id: str
+    approved: bool
+
+
+@dataclass(frozen=True)
 class SystemEvent:
     message: str
 
@@ -66,6 +87,7 @@ AgentEvent = (
     TokenEvent
     | ToolCallEvent
     | ToolResultEvent
+    | ApprovalRequiredEvent
     | SystemEvent
     | ContextTrimmedEvent
     | MemoryUpdatedEvent
@@ -121,6 +143,8 @@ class WorkspaceAgent:
         token_counter="approximate",
         summary_model=None,
         max_summary_characters=2000,
+        approval_required_tools: set[str] | None = None,
+        approval_previewers: dict[str, Callable] | None = None,
     ):
         self.model = model
         self.tools = list(tools)
@@ -134,13 +158,18 @@ class WorkspaceAgent:
         self.token_counter = token_counter
         self.summary_model = summary_model if summary_model is not None else model
         self.max_summary_characters = max_summary_characters
+        self.approval_required_tools = set(approval_required_tools or ())
+        self.approval_previewers = dict(approval_previewers or {})
         self.tools_by_name = {tool.name: tool for tool in self.tools}
         self.model_with_tools = self.model.bind_tools(self.tools)
         self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
         self.memory_summary = ""
         self._turn_lock = Lock()
 
-    def stream_turn(self, question: str) -> Iterator[AgentEvent]:
+    def stream_turn(
+        self,
+        question: str,
+    ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
         """运行一轮并产生事件；提前停止消费时应关闭返回的生成器。"""
         if not self._turn_lock.acquire(blocking=False):
             raise RuntimeError("同一 WorkspaceAgent 不能同时运行多个对话轮次")
@@ -150,7 +179,10 @@ class WorkspaceAgent:
         finally:
             self._turn_lock.release()
 
-    def _run_turn_transaction(self, question: str) -> Iterator[AgentEvent]:
+    def _run_turn_transaction(
+        self,
+        question: str,
+    ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
         current_message = HumanMessage(content=question)
         base_system_message = SystemMessage(content=SYSTEM_PROMPT)
         required_messages = [base_system_message, current_message]
@@ -527,11 +559,11 @@ class WorkspaceAgent:
         tools_allowed: bool,
         state: _TurnState,
         working_messages: list,
-    ) -> Iterator[AgentEvent]:
+    ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
         tool_call_id = tool_call["id"]
         tool_name = tool_call["name"]
         internal_args = deepcopy(tool_call["args"])
-        event_args = _freeze(deepcopy(internal_args))
+        event_args = _freeze(self._redact_tool_args(internal_args))
         signature = (
             tool_name,
             json.dumps(
@@ -628,6 +660,68 @@ class WorkspaceAgent:
             )
             return
 
+        if tool_name in self.approval_required_tools:
+            preview = ""
+            previewer = self.approval_previewers.get(tool_name)
+            if previewer is not None:
+                try:
+                    preview = self._invoke_approval_previewer(
+                        previewer,
+                        internal_args,
+                    )
+                except Exception as error:
+                    preview_error = f"工具预览失败：{error}"
+                    character_count, truncated = self._append_tool_message(
+                        messages=working_messages,
+                        content=preview_error,
+                        tool_call_id=tool_call_id,
+                        state=state,
+                    )
+                    yield ToolResultEvent(
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                        status="error",
+                        character_count=character_count,
+                        detail="变更预览失败",
+                        truncated=truncated,
+                    )
+                    return
+
+            decision = yield ApprovalRequiredEvent(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                args=event_args,
+                preview=preview,
+            )
+            if (
+                not isinstance(decision, ApprovalDecision)
+                or decision.tool_call_id != tool_call_id
+                or decision.approved is not True
+            ):
+                if (
+                    isinstance(decision, ApprovalDecision)
+                    and decision.tool_call_id != tool_call_id
+                ):
+                    detail = "审批调用 ID 不匹配"
+                else:
+                    detail = "用户未批准"
+                self._append_control_tool_message(
+                    messages=working_messages,
+                    content=(
+                        f"用户未批准执行工具 {tool_name}，"
+                        "本次调用未执行。请根据已有信息继续回答。"
+                    ),
+                    tool_call_id=tool_call_id,
+                )
+                yield ToolResultEvent(
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                    status="skipped",
+                    character_count=0,
+                    detail=detail,
+                )
+                return
+
         state.tool_call_count += 1
         if state.tool_call_count >= self.max_tool_calls:
             state.tool_budget_exhausted = True
@@ -653,6 +747,59 @@ class WorkspaceAgent:
             character_count=character_count,
             truncated=truncated,
         )
+
+    @classmethod
+    def _redact_tool_args(cls, value):
+        if isinstance(value, dict):
+            redacted = {}
+            for key, item in value.items():
+                if cls._is_sensitive_argument_name(key):
+                    redacted[key] = (
+                        f"<{cls._argument_character_count(item)} characters>"
+                    )
+                else:
+                    redacted[key] = cls._redact_tool_args(item)
+            return redacted
+        if isinstance(value, list):
+            return [cls._redact_tool_args(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._redact_tool_args(item) for item in value)
+        return deepcopy(value)
+
+    @staticmethod
+    def _is_sensitive_argument_name(name) -> bool:
+        normalized_name = str(name).lower().replace("-", "_")
+        return any(
+            sensitive_name in normalized_name
+            for sensitive_name in REDACTED_ARGUMENT_NAMES
+        )
+
+    @staticmethod
+    def _argument_character_count(value) -> int:
+        if isinstance(value, str):
+            return len(value)
+        try:
+            return len(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        except (TypeError, ValueError):
+            return len(str(value))
+
+    @staticmethod
+    def _invoke_approval_previewer(
+        previewer: Callable,
+        tool_args: dict,
+    ) -> str:
+        preview_args = deepcopy(tool_args)
+        if hasattr(previewer, "invoke"):
+            preview = previewer.invoke(preview_args)
+        else:
+            preview = previewer(**preview_args)
+        return str(preview)
 
     def _append_tool_message(
         self,

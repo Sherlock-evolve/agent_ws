@@ -6,6 +6,8 @@ from langchain_openai import ChatOpenAI
 
 from agent import (
     AgentEvent,
+    ApprovalDecision,
+    ApprovalRequiredEvent,
     ContextTrimmedEvent,
     MemoryUpdatedEvent,
     SystemEvent,
@@ -14,7 +16,13 @@ from agent import (
     ToolResultEvent,
     WorkspaceAgent,
 )
-from tools import list_files, read_file, search_text
+from tools import (
+    list_files,
+    preview_write_file,
+    read_file,
+    search_text,
+    write_file,
+)
 
 
 ai_label_printed = False
@@ -68,6 +76,10 @@ def render_event(event: AgentEvent) -> None:
                 f"返回 {event.character_count} 个字符"
                 f"{truncated_label}"
             )
+    elif isinstance(event, ApprovalRequiredEvent):
+        print(f"[审批] 工具 {event.tool_name} 等待用户确认")
+        if event.preview:
+            print(event.preview)
     elif isinstance(event, SystemEvent):
         print(f"[系统] {event.message}")
     elif isinstance(event, ContextTrimmedEvent):
@@ -95,7 +107,9 @@ def main() -> None:
     )
     agent = WorkspaceAgent(
         model=model,
-        tools=[list_files, read_file, search_text],
+        tools=[list_files, read_file, search_text, write_file],
+        approval_required_tools={write_file.name},
+        approval_previewers={write_file.name: preview_write_file},
     )
 
     while True:
@@ -108,8 +122,28 @@ def main() -> None:
             continue
 
         start_turn()
-        for event in agent.stream_turn(question):
+        stream = agent.stream_turn(question)
+        decision = None
+
+        while True:
+            try:
+                event = stream.send(decision)
+            except StopIteration:
+                break
+
+            decision = None
             render_event(event)
+
+            if isinstance(event, ApprovalRequiredEvent):
+                try:
+                    answer = input("是否允许执行？[y/N] ")
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                decision = ApprovalDecision(
+                    tool_call_id=event.tool_call_id,
+                    approved=answer.strip().lower() in {"y", "yes"},
+                )
+
         finish_turn()
 
 
