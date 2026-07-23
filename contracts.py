@@ -24,6 +24,8 @@ class ToolResultEvent:
     character_count: int
     detail: str = ""
     truncated: bool = False
+    duration_ms: int | None = None
+    error_type: str = ""
 
 
 @dataclass(frozen=True)

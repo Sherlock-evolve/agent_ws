@@ -30,7 +30,9 @@ from agent import (
 from contracts import (
     EventEnvelope,
     ModelCallMetricsEvent,
+    PreparedToolAction,
     SessionSavedEvent,
+    ToolActionConflictError,
 )
 from persistent_session import (
     PersistentSession,
@@ -41,6 +43,7 @@ from persistent_session import (
 
 TOOL_EXECUTIONS = []
 ECHO_EXECUTIONS = []
+TIMED_FAILURE_EXECUTIONS = []
 
 
 @tool
@@ -55,6 +58,19 @@ def echo_test(value: str) -> str:
     """返回测试输入。"""
     ECHO_EXECUTIONS.append(value)
     return value
+
+
+class TimedToolFailure(RuntimeError):
+    pass
+
+
+@tool
+def fail_timed_tool(value: str) -> str:
+    """记录执行后抛出测试异常。"""
+    TIMED_FAILURE_EXECUTIONS.append(value)
+    raise TimedToolFailure(
+        "敏感工具异常正文不应进入指标字段"
+    )
 
 
 class ScriptedModel:
@@ -1922,7 +1938,16 @@ def test_model_metrics_call_indexes_increase_across_tool_loop():
         model=model,
         tools=[read_test_note],
         monotonic_clock=ScriptedClock(
-            [0.0, 0.01, 0.02, 1.0, 1.03, 1.10]
+            [
+                0.0,
+                0.01,
+                0.02,
+                0.10,
+                0.112,
+                1.0,
+                1.03,
+                1.10,
+            ]
         ),
     )
 
@@ -1943,6 +1968,397 @@ def test_model_metrics_call_indexes_increase_across_tool_loop():
     assert events.index(metrics[0]) < first_tool_event_index
     assert TOOL_EXECUTIONS == ["read_test_note"]
     assert model.call_log == [True, True]
+
+
+def test_tool_metrics_measure_successful_invoke_duration():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("timed-success", "echo_test", '{"value":"measured"}'),
+            ),
+            [AIMessageChunk(content="计时完成")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        monotonic_clock=ScriptedClock(
+            [
+                0.0,
+                0.01,
+                0.02,
+                0.10,
+                0.112,
+                1.0,
+                1.01,
+                1.02,
+            ]
+        ),
+    )
+
+    events = list(agent.stream_turn("执行计时工具"))
+    result = next(
+        event
+        for event in events
+        if isinstance(event, ToolResultEvent)
+    )
+
+    assert result.tool_call_id == "timed-success"
+    assert result.status == "success"
+    assert result.duration_ms == 12
+    assert result.error_type == ""
+    assert ECHO_EXECUTIONS == ["measured"]
+
+
+def test_tool_metrics_record_exception_type_without_message():
+    TIMED_FAILURE_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "timed-error",
+                    fail_timed_tool.name,
+                    '{"value":"entered"}',
+                ),
+            ),
+            [AIMessageChunk(content="异常后回答")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[fail_timed_tool],
+        monotonic_clock=ScriptedClock(
+            [
+                0.0,
+                0.01,
+                0.02,
+                0.10,
+                0.137,
+                1.0,
+                1.01,
+                1.02,
+            ]
+        ),
+    )
+
+    events = list(agent.stream_turn("触发工具异常"))
+    result = next(
+        event
+        for event in events
+        if isinstance(event, ToolResultEvent)
+    )
+
+    assert result.status == "error"
+    assert result.duration_ms == 37
+    assert result.error_type == "TimedToolFailure"
+    assert "敏感工具异常正文" not in repr(result)
+    assert TIMED_FAILURE_EXECUTIONS == ["entered"]
+
+
+def test_prepared_action_metrics_cover_success_and_conflict():
+    outcomes = [
+        ("prepared-success", False, 21, "success", ""),
+        (
+            "prepared-conflict",
+            True,
+            34,
+            "error",
+            "ToolActionConflictError",
+        ),
+    ]
+
+    for call_id, conflicts, duration, status, error_type in outcomes:
+        executed = []
+
+        def execute_action():
+            executed.append(call_id)
+            if conflicts:
+                raise ToolActionConflictError(
+                    "敏感冲突正文不应进入指标字段"
+                )
+            return "prepared result"
+
+        def prepare_action(value):
+            return PreparedToolAction(
+                preview=f"preview for {value}",
+                execute=execute_action,
+            )
+
+        model = ScriptedModel(
+            [
+                parallel_tool_call_response(
+                    (
+                        call_id,
+                        "echo_test",
+                        '{"value":"prepared"}',
+                    ),
+                ),
+                [AIMessageChunk(content="准备操作完成")],
+            ]
+        )
+        end_time = 0.10 + (duration / 1000)
+        agent = WorkspaceAgent(
+            model=model,
+            tools=[echo_test],
+            approval_required_tools={"echo_test"},
+            approval_preparers={"echo_test": prepare_action},
+            monotonic_clock=ScriptedClock(
+                [
+                    0.0,
+                    0.01,
+                    0.02,
+                    0.10,
+                    end_time,
+                    1.0,
+                    1.01,
+                    1.02,
+                ]
+            ),
+        )
+
+        stream = agent.stream_turn("执行准备操作")
+        next_without_metrics(stream)
+        approval = next_without_metrics(stream)
+        result = stream.send(
+            ApprovalDecision(
+                tool_call_id=approval.tool_call_id,
+                approved=True,
+            )
+        )
+        list(stream)
+
+        assert result.tool_call_id == call_id
+        assert result.status == status
+        assert result.duration_ms == duration
+        assert result.error_type == error_type
+        assert "敏感冲突正文" not in repr(result)
+        assert executed == [call_id]
+
+
+def test_unexecuted_tool_results_keep_empty_timing_metrics():
+    ECHO_EXECUTIONS.clear()
+    TOOL_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("unknown", "missing_tool", "{}"),
+                ("invalid", "echo_test", "{}"),
+                ("executed", "read_test_note", "{}"),
+                ("duplicate", "read_test_note", "{}"),
+                ("budget", "echo_test", '{"value":"blocked"}'),
+            ),
+            [AIMessageChunk(content="未执行分支完成")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test, read_test_note],
+        max_tool_calls=1,
+        monotonic_clock=lambda: 0.0,
+    )
+
+    events = list(agent.stream_turn("覆盖前置检查"))
+    results = {
+        event.tool_call_id: event
+        for event in events
+        if isinstance(event, ToolResultEvent)
+    }
+
+    assert results["executed"].duration_ms == 0
+    assert results["executed"].error_type == ""
+    for call_id in ["unknown", "invalid", "duplicate", "budget"]:
+        assert results[call_id].duration_ms is None
+        assert results[call_id].error_type == ""
+
+    approval_cases = [
+        (
+            ApprovalDecision(
+                tool_call_id="approval-skipped",
+                approved=False,
+            ),
+            "用户未批准",
+        ),
+        (
+            ApprovalDecision(
+                tool_call_id="wrong-id",
+                approved=True,
+            ),
+            "审批调用 ID 不匹配",
+        ),
+    ]
+    for decision, expected_detail in approval_cases:
+        approval_model = ScriptedModel(
+            [
+                parallel_tool_call_response(
+                    (
+                        "approval-skipped",
+                        "echo_test",
+                        '{"value":"protected"}',
+                    ),
+                ),
+                [AIMessageChunk(content="审批跳过后回答")],
+            ]
+        )
+        approval_agent = WorkspaceAgent(
+            model=approval_model,
+            tools=[echo_test],
+            approval_required_tools={"echo_test"},
+            monotonic_clock=lambda: 0.0,
+        )
+        approval_stream = approval_agent.stream_turn("等待审批")
+        next_without_metrics(approval_stream)
+        next_without_metrics(approval_stream)
+        approval_result = approval_stream.send(decision)
+        list(approval_stream)
+
+        assert approval_result.detail == expected_detail
+        assert approval_result.duration_ms is None
+        assert approval_result.error_type == ""
+
+    handler_failures = [
+        {
+            "approval_previewers": {
+                "echo_test": lambda **kwargs: (_ for _ in ()).throw(
+                    ValueError("预览失败")
+                )
+            }
+        },
+        {
+            "approval_preparers": {
+                "echo_test": lambda **kwargs: (_ for _ in ()).throw(
+                    ValueError("准备失败")
+                )
+            }
+        },
+    ]
+    for handlers in handler_failures:
+        failure_model = ScriptedModel(
+            [
+                parallel_tool_call_response(
+                    (
+                        "handler-failure",
+                        "echo_test",
+                        '{"value":"protected"}',
+                    ),
+                ),
+                [AIMessageChunk(content="处理器失败后回答")],
+            ]
+        )
+        failure_agent = WorkspaceAgent(
+            model=failure_model,
+            tools=[echo_test],
+            approval_required_tools={"echo_test"},
+            monotonic_clock=lambda: 0.0,
+            **handlers,
+        )
+
+        failure_events = list(
+            failure_agent.stream_turn("处理器失败")
+        )
+        failure_result = next(
+            event
+            for event in failure_events
+            if isinstance(event, ToolResultEvent)
+        )
+
+        assert failure_result.duration_ms is None
+        assert failure_result.error_type == ""
+
+    result_budget_model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("result-first", "echo_test", '{"value":"a"}'),
+                ("result-skipped", "echo_test", '{"value":"b"}'),
+            ),
+            [AIMessageChunk(content="结果预算后回答")],
+        ]
+    )
+    result_budget_agent = WorkspaceAgent(
+        model=result_budget_model,
+        tools=[echo_test],
+        max_tool_result_characters=1,
+        monotonic_clock=lambda: 0.0,
+    )
+    result_budget_events = list(
+        result_budget_agent.stream_turn("耗尽结果预算")
+    )
+    result_budget_results = {
+        event.tool_call_id: event
+        for event in result_budget_events
+        if isinstance(event, ToolResultEvent)
+    }
+    assert result_budget_results["result-first"].duration_ms == 0
+    assert result_budget_results["result-skipped"].duration_ms is None
+    assert result_budget_results["result-skipped"].error_type == ""
+
+    disabled_model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("tools-disabled", "echo_test", '{"value":"blocked"}'),
+            )
+        ]
+    )
+    disabled_agent = WorkspaceAgent(
+        model=disabled_model,
+        tools=[echo_test],
+        max_agent_loops=1,
+        monotonic_clock=lambda: 0.0,
+    )
+    disabled_result = next(
+        event
+        for event in disabled_agent.stream_turn("最后一轮")
+        if isinstance(event, ToolResultEvent)
+    )
+    assert disabled_result.duration_ms is None
+    assert disabled_result.error_type == ""
+
+
+def test_parallel_tool_metrics_keep_separate_durations_and_ids():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("parallel-first", "echo_test", '{"value":"first"}'),
+                ("parallel-second", "echo_test", '{"value":"second"}'),
+            ),
+            [AIMessageChunk(content="并行调用完成")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        monotonic_clock=ScriptedClock(
+            [
+                0.0,
+                0.01,
+                0.02,
+                0.10,
+                0.111,
+                0.20,
+                0.227,
+                1.0,
+                1.01,
+                1.02,
+            ]
+        ),
+    )
+
+    events = list(agent.stream_turn("分别计时"))
+    results = [
+        event
+        for event in events
+        if isinstance(event, ToolResultEvent)
+    ]
+
+    assert [
+        (event.tool_call_id, event.duration_ms, event.error_type)
+        for event in results
+    ] == [
+        ("parallel-first", 11, ""),
+        ("parallel-second", 27, ""),
+    ]
+    assert ECHO_EXECUTIONS == ["first", "second"]
 
 
 def test_snapshot_round_trip_with_tool_history_and_memory():

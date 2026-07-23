@@ -89,8 +89,13 @@ def render_event(event: AgentEvent) -> None:
         )
         print(f"[第 {event.step} 轮工具调用] {event.name} {args_text}")
     elif isinstance(event, ToolResultEvent):
+        duration_label = (
+            f"，耗时 {event.duration_ms} ms"
+            if event.duration_ms is not None
+            else ""
+        )
         if event.status == "skipped":
-            print(f"[工具跳过] {event.detail}")
+            print(f"[工具跳过] {event.detail}{duration_label}")
         else:
             status_label = STATUS_LABELS[event.status]
             truncated_label = "（已截断）" if event.truncated else ""
@@ -98,6 +103,7 @@ def render_event(event: AgentEvent) -> None:
                 f"[工具结果] {status_label}，"
                 f"返回 {event.character_count} 个字符"
                 f"{truncated_label}"
+                f"{duration_label}"
             )
     elif isinstance(event, ApprovalRequiredEvent):
         print(f"[审批] 工具 {event.tool_name} 等待用户确认")

@@ -918,6 +918,46 @@ class WorkspaceAgent:
             )
             return
 
+        selected_tool = self.tools_by_name.get(tool_name)
+        if selected_tool is None:
+            character_count, truncated = self._append_tool_message(
+                messages=working_messages,
+                content=f"未知工具：{tool_name}",
+                tool_call_id=tool_call_id,
+                state=state,
+            )
+            yield ToolResultEvent(
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                status="error",
+                character_count=character_count,
+                detail="未知工具",
+                truncated=truncated,
+            )
+            return
+
+        try:
+            self._validate_tool_arguments(
+                selected_tool,
+                internal_args,
+            )
+        except Exception as error:
+            character_count, truncated = self._append_tool_message(
+                messages=working_messages,
+                content=f"工具参数非法：{error}",
+                tool_call_id=tool_call_id,
+                state=state,
+            )
+            yield ToolResultEvent(
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                status="error",
+                character_count=character_count,
+                detail="参数非法",
+                truncated=truncated,
+            )
+            return
+
         prepared_action = None
         if tool_name in self.approval_required_tools:
             preview = ""
@@ -997,14 +1037,14 @@ class WorkspaceAgent:
         if state.tool_call_count >= self.max_tool_calls:
             state.tool_budget_exhausted = True
 
+        execution_started_at = self.monotonic_clock()
         try:
             if prepared_action is not None:
-                tool_result_text = str(prepared_action.execute())
+                raw_tool_result = prepared_action.execute()
             else:
-                selected_tool = self.tools_by_name[tool_name]
-                tool_result_text = str(selected_tool.invoke(internal_args))
-            tool_status = "success"
+                raw_tool_result = selected_tool.invoke(internal_args)
         except ToolActionConflictError as error:
+            execution_finished_at = self.monotonic_clock()
             self._append_control_tool_message(
                 messages=working_messages,
                 content=(
@@ -1020,11 +1060,28 @@ class WorkspaceAgent:
                 status="error",
                 character_count=0,
                 detail="写入冲突",
+                duration_ms=self._elapsed_ms(
+                    execution_started_at,
+                    execution_finished_at,
+                ),
+                error_type=type(error).__name__,
             )
             return
         except Exception as error:
+            execution_finished_at = self.monotonic_clock()
             tool_result_text = f"工具执行失败：{error}"
             tool_status = "error"
+            tool_error_type = type(error).__name__
+        else:
+            execution_finished_at = self.monotonic_clock()
+            try:
+                tool_result_text = str(raw_tool_result)
+                tool_status = "success"
+                tool_error_type = ""
+            except Exception as error:
+                tool_result_text = f"工具结果转换失败：{error}"
+                tool_status = "error"
+                tool_error_type = type(error).__name__
 
         character_count, truncated = self._append_tool_message(
             messages=working_messages,
@@ -1038,6 +1095,11 @@ class WorkspaceAgent:
             status=tool_status,
             character_count=character_count,
             truncated=truncated,
+            duration_ms=self._elapsed_ms(
+                execution_started_at,
+                execution_finished_at,
+            ),
+            error_type=tool_error_type,
         )
 
     @classmethod
@@ -1126,6 +1188,24 @@ class WorkspaceAgent:
         if hasattr(handler, "invoke"):
             return handler.invoke(handler_args)
         return handler(**handler_args)
+
+    @staticmethod
+    def _validate_tool_arguments(selected_tool, tool_args: dict) -> None:
+        get_input_schema = getattr(
+            selected_tool,
+            "get_input_schema",
+            None,
+        )
+        if not callable(get_input_schema):
+            return
+        input_schema = get_input_schema()
+        model_validate = getattr(input_schema, "model_validate", None)
+        if callable(model_validate):
+            model_validate(tool_args)
+            return
+        parse_obj = getattr(input_schema, "parse_obj", None)
+        if callable(parse_obj):
+            parse_obj(tool_args)
 
     def _append_tool_message(
         self,
