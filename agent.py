@@ -11,6 +11,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
     message_chunk_to_message,
+    trim_messages,
 )
 
 
@@ -48,7 +49,25 @@ class SystemEvent:
     message: str
 
 
-AgentEvent = TokenEvent | ToolCallEvent | ToolResultEvent | SystemEvent
+@dataclass(frozen=True)
+class ContextTrimmedEvent:
+    removed_message_count: int
+    remaining_message_count: int
+
+
+@dataclass(frozen=True)
+class MemoryUpdatedEvent:
+    character_count: int
+
+
+AgentEvent = (
+    TokenEvent
+    | ToolCallEvent
+    | ToolResultEvent
+    | SystemEvent
+    | ContextTrimmedEvent
+    | MemoryUpdatedEvent
+)
 
 
 class _FrozenDict(dict):
@@ -93,14 +112,23 @@ class WorkspaceAgent:
         tools,
         max_agent_loops=5,
         max_tool_calls=8,
+        max_context_tokens=6000,
+        token_counter="approximate",
+        summary_model=None,
+        max_summary_characters=2000,
     ):
         self.model = model
         self.tools = list(tools)
         self.max_agent_loops = max_agent_loops
         self.max_tool_calls = max_tool_calls
+        self.max_context_tokens = max_context_tokens
+        self.token_counter = token_counter
+        self.summary_model = summary_model if summary_model is not None else model
+        self.max_summary_characters = max_summary_characters
         self.tools_by_name = {tool.name: tool for tool in self.tools}
         self.model_with_tools = self.model.bind_tools(self.tools)
         self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
+        self.memory_summary = ""
         self._turn_lock = Lock()
 
     def stream_turn(self, question: str) -> Iterator[AgentEvent]:
@@ -114,8 +142,69 @@ class WorkspaceAgent:
             self._turn_lock.release()
 
     def _run_turn_transaction(self, question: str) -> Iterator[AgentEvent]:
-        working_messages = list(self.messages)
-        working_messages.append(HumanMessage(content=question))
+        current_message = HumanMessage(content=question)
+        base_system_message = SystemMessage(content=SYSTEM_PROMPT)
+        required_messages = [base_system_message, current_message]
+        required_context = self._trim_history(required_messages)
+        if not self._contains_required_context(
+            required_context,
+            current_message,
+        ):
+            yield SystemEvent(
+                message=(
+                    "系统消息和当前问题超过上下文预算，"
+                    "当前任务已停止。"
+                )
+            )
+            return
+
+        working_summary = self.memory_summary
+        required_with_summary = self._with_fitting_summary(
+            required_messages,
+            working_summary,
+        )
+        candidate_messages = [
+            required_with_summary[0],
+            *self.messages[1:],
+            current_message,
+        ]
+        working_messages = self._trim_history(candidate_messages)
+        if not self._contains_required_context(
+            working_messages,
+            current_message,
+        ):
+            yield SystemEvent(
+                message=(
+                    "系统消息和当前问题超过上下文预算，"
+                    "当前任务已停止。"
+                )
+            )
+            return
+        working_messages = self._remove_incomplete_tool_groups(
+            working_messages,
+            current_message,
+        )
+        removed_message_count = len(candidate_messages) - len(working_messages)
+        if removed_message_count > 0:
+            yield ContextTrimmedEvent(
+                removed_message_count=removed_message_count,
+                remaining_message_count=len(working_messages),
+            )
+
+        removed_turns = self._extract_removed_turns(working_messages)
+        if removed_turns:
+            updated_summary = self._update_memory_summary(
+                working_summary,
+                removed_turns,
+            )
+            if updated_summary is not None:
+                working_summary = updated_summary
+
+        working_messages = self._with_fitting_summary(
+            working_messages,
+            working_summary,
+        )
+
         state = _TurnState()
         answered = False
         task_stopped = False
@@ -141,8 +230,14 @@ class WorkspaceAgent:
             working_messages.append(response)
 
             if not response.tool_calls:
+                memory_changed = working_summary != self.memory_summary
                 self.messages = working_messages
+                self.memory_summary = working_summary
                 answered = True
+                if memory_changed:
+                    yield MemoryUpdatedEvent(
+                        character_count=len(self.memory_summary),
+                    )
                 break
 
             for tool_call in response.tool_calls:
@@ -161,6 +256,233 @@ class WorkspaceAgent:
                     "已停止。"
                 )
             )
+
+    def _trim_history(self, messages: list) -> list:
+        return trim_messages(
+            messages,
+            max_tokens=self.max_context_tokens,
+            token_counter=self.token_counter,
+            strategy="last",
+            include_system=True,
+            start_on=HumanMessage,
+            allow_partial=False,
+        )
+
+    def _with_fitting_summary(
+        self,
+        messages: list,
+        summary: str,
+    ) -> list:
+        messages_with_summary = list(messages)
+        limited_summary = summary[: max(0, self.max_summary_characters)]
+
+        def build_messages(summary_length: int) -> list:
+            fitted_messages = list(messages_with_summary)
+            fitted_messages[0] = self._build_system_message(
+                limited_summary[:summary_length]
+            )
+            return fitted_messages
+
+        if not limited_summary:
+            return build_messages(0)
+        if self._messages_fit(build_messages(len(limited_summary))):
+            return build_messages(len(limited_summary))
+
+        lower_bound = 0
+        upper_bound = len(limited_summary)
+        best_length = 0
+        while lower_bound <= upper_bound:
+            middle = (lower_bound + upper_bound) // 2
+            if self._messages_fit(build_messages(middle)):
+                best_length = middle
+                lower_bound = middle + 1
+            else:
+                upper_bound = middle - 1
+
+        return build_messages(best_length)
+
+    def _messages_fit(self, messages: list) -> bool:
+        trimmed_messages = self._trim_history(messages)
+        return (
+            len(trimmed_messages) == len(messages)
+            and self._contains_required_context(
+                trimmed_messages,
+                messages[-1],
+            )
+        )
+
+    @staticmethod
+    def _build_system_message(summary: str) -> SystemMessage:
+        if not summary:
+            return SystemMessage(content=SYSTEM_PROMPT)
+        return SystemMessage(
+            content=(
+                f"{SYSTEM_PROMPT}\n\n"
+                "长期记忆摘要：\n"
+                f"{summary}"
+            )
+        )
+
+    def _extract_removed_turns(self, working_messages: list) -> list[list]:
+        retained_message_ids = {id(message) for message in working_messages}
+        history_turns = []
+        current_turn = []
+
+        for message in self.messages[1:]:
+            if isinstance(message, HumanMessage):
+                if current_turn:
+                    history_turns.append(current_turn)
+                current_turn = [message]
+            elif current_turn:
+                current_turn.append(message)
+        if current_turn:
+            history_turns.append(current_turn)
+
+        return [
+            turn
+            for turn in history_turns
+            if (
+                isinstance(turn[-1], AIMessage)
+                and not turn[-1].tool_calls
+                and all(id(message) not in retained_message_ids for message in turn)
+            )
+        ]
+
+    def _update_memory_summary(
+        self,
+        existing_summary: str,
+        removed_turns: list[list],
+    ) -> str | None:
+        removed_dialogue = self._format_removed_turns(removed_turns)
+        if not removed_dialogue:
+            return None
+
+        summary_messages = [
+            SystemMessage(
+                content=(
+                    "你负责维护项目对话的长期记忆摘要。"
+                    "请重点保留用户偏好、项目目标、已作出的决定、"
+                    "未完成事项和重要结论。"
+                    "不要补充原对话中不存在的信息，"
+                    f"输出不超过 {self.max_summary_characters} 个字符。"
+                )
+            ),
+            HumanMessage(
+                content=(
+                    "已有摘要：\n"
+                    f"{existing_summary or '（无）'}\n\n"
+                    "新删除的完整对话轮次：\n"
+                    f"{removed_dialogue}"
+                )
+            ),
+        ]
+
+        try:
+            summary_parts = []
+            for chunk in self.summary_model.stream(summary_messages):
+                if isinstance(chunk.content, str):
+                    text = chunk.content
+                else:
+                    text = chunk.text
+                if text:
+                    summary_parts.append(text)
+        except Exception:
+            return None
+
+        updated_summary = "".join(summary_parts).strip()
+        if not updated_summary:
+            return None
+        return updated_summary[: max(0, self.max_summary_characters)]
+
+    @classmethod
+    def _format_removed_turns(cls, removed_turns: list[list]) -> str:
+        formatted_turns = []
+
+        for turn in removed_turns:
+            user_text = cls._message_text(turn[0])
+            final_answer = ""
+            for message in turn[1:]:
+                if not isinstance(message, AIMessage):
+                    continue
+                message_text = cls._message_text(message)
+                if message_text:
+                    final_answer = message_text
+
+            if user_text and final_answer:
+                formatted_turns.append(
+                    f"用户：{user_text}\n助手：{final_answer}"
+                )
+
+        return "\n\n".join(formatted_turns)
+
+    @staticmethod
+    def _message_text(message) -> str:
+        if isinstance(message.content, str):
+            return message.content
+        return message.text
+
+    @staticmethod
+    def _contains_required_context(
+        messages: list,
+        current_message: HumanMessage,
+    ) -> bool:
+        return (
+            len(messages) >= 2
+            and isinstance(messages[0], SystemMessage)
+            and messages[-1] == current_message
+        )
+
+    @classmethod
+    def _remove_incomplete_tool_groups(
+        cls,
+        messages: list,
+        current_message: HumanMessage,
+    ) -> list:
+        valid_messages = list(messages)
+        while not cls._has_complete_tool_groups(valid_messages):
+            next_turn_index = next(
+                (
+                    index
+                    for index, message in enumerate(valid_messages[2:], start=2)
+                    if isinstance(message, HumanMessage)
+                ),
+                None,
+            )
+            if next_turn_index is None:
+                return [valid_messages[0], current_message]
+            valid_messages = [
+                valid_messages[0],
+                *valid_messages[next_turn_index:],
+            ]
+        return valid_messages
+
+    @staticmethod
+    def _has_complete_tool_groups(messages: list) -> bool:
+        pending_tool_call_ids = None
+
+        for message in messages:
+            if isinstance(message, AIMessage) and message.tool_calls:
+                if pending_tool_call_ids:
+                    return False
+                pending_tool_call_ids = {
+                    tool_call["id"] for tool_call in message.tool_calls
+                }
+                continue
+
+            if isinstance(message, ToolMessage):
+                if (
+                    pending_tool_call_ids is None
+                    or message.tool_call_id not in pending_tool_call_ids
+                ):
+                    return False
+                pending_tool_call_ids.remove(message.tool_call_id)
+                continue
+
+            if pending_tool_call_ids:
+                return False
+            pending_tool_call_ids = None
+
+        return not pending_tool_call_ids
 
     def _stream_response(
         self,

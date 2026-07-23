@@ -18,6 +18,11 @@ IGNORED_DIRECTORIES = {
 }
 MAX_SEARCH_RESULTS = 50
 MAX_SEARCH_LINE_LENGTH = 300
+MAX_FILE_SIZE_BYTES = 1024 * 1024
+MAX_READ_LINES = 200
+MAX_READ_CHARACTERS = 20_000
+MAX_READ_BODY_CHARACTERS = 19_700
+MAX_LIST_ENTRIES = 200
 
 
 def _is_sensitive_name(name: str) -> bool:
@@ -95,19 +100,92 @@ def list_files(directory: str = ".") -> str:
             display_path += "/"
         entries.append(display_path)
 
-    return "\n".join(sorted(entries)) or "（目录为空）"
+    entries = sorted(entries)
+    if len(entries) > MAX_LIST_ENTRIES:
+        entries = entries[:MAX_LIST_ENTRIES]
+        entries.append("结果已截断")
+
+    return "\n".join(entries) or "（目录为空）"
 
 
 @tool
-def read_file(path: str) -> str:
-    """读取当前项目内指定 UTF-8 文本文件；文件必须使用项目根目录下的相对路径。"""
+def read_file(
+    path: str,
+    start_line: int = 1,
+    line_count: int = 200,
+) -> str:
+    """分页读取项目内 UTF-8 文本文件；路径相对项目根目录，每次最多读取 200 行。"""
+    if start_line < 1:
+        raise ValueError("start_line 必须大于等于 1")
+    if line_count < 1 or line_count > MAX_READ_LINES:
+        raise ValueError(f"line_count 必须在 1 到 {MAX_READ_LINES} 之间")
+
     file_path = _resolve_workspace_path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"文件不存在：{path}")
     if not file_path.is_file():
         raise IsADirectoryError(f"不是文件：{path}")
+    if file_path.stat().st_size > MAX_FILE_SIZE_BYTES:
+        raise ValueError("文件超过 1 MB，拒绝读取")
 
-    return file_path.read_text(encoding="utf-8")
+    output_lines = []
+    output_length = 0
+    next_start_line = None
+    truncated_line = None
+
+    with file_path.open("r", encoding="utf-8") as file:
+        for _ in range(start_line - 1):
+            if file.readline() == "":
+                return f"（从第 {start_line} 行起没有内容）"
+
+        for offset in range(line_count):
+            line_number = start_line + offset
+            raw_line = file.readline()
+            if raw_line == "":
+                break
+
+            formatted_line = f"{line_number}: {raw_line.rstrip(chr(13) + chr(10))}"
+            separator_length = 1 if output_lines else 0
+            remaining = (
+                MAX_READ_BODY_CHARACTERS
+                - output_length
+                - separator_length
+            )
+
+            if len(formatted_line) > remaining:
+                if output_lines:
+                    next_start_line = line_number
+                else:
+                    output_lines.append(
+                        formatted_line[: MAX_READ_BODY_CHARACTERS - 1] + "…"
+                    )
+                    output_length = len(output_lines[0])
+                    truncated_line = line_number
+                    if file.readline() != "":
+                        next_start_line = line_number + 1
+                break
+
+            output_lines.append(formatted_line)
+            output_length += separator_length + len(formatted_line)
+        else:
+            if file.readline() != "":
+                next_start_line = start_line + line_count
+
+    if not output_lines:
+        return f"（从第 {start_line} 行起没有内容）"
+
+    hints = []
+    if truncated_line is not None:
+        hints.append(f"[第 {truncated_line} 行内容过长，已截断]")
+    if next_start_line is not None:
+        last_shown_line = start_line + len(output_lines) - 1
+        hints.append(
+            f"[仅显示第 {start_line}–{last_shown_line} 行，"
+            f"可使用 start_line={next_start_line} 继续读取]"
+        )
+
+    result = "\n".join([*output_lines, *hints])
+    return result[:MAX_READ_CHARACTERS]
 
 
 @tool
@@ -171,6 +249,8 @@ def search_text(query: str, directory: str = ".") -> str:
                 continue
 
             try:
+                if resolved_file.stat().st_size > MAX_FILE_SIZE_BYTES:
+                    continue
                 content = resolved_file.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 continue

@@ -9,7 +9,15 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import tool
 
-from agent import TokenEvent, ToolCallEvent, ToolResultEvent, WorkspaceAgent
+from agent import (
+    ContextTrimmedEvent,
+    MemoryUpdatedEvent,
+    SystemEvent,
+    TokenEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+    WorkspaceAgent,
+)
 
 
 TOOL_EXECUTIONS = []
@@ -37,22 +45,26 @@ class ScriptedModel:
         *,
         tools_enabled=False,
         call_log=None,
+        message_log=None,
     ):
         self.responses = (
             responses if isinstance(responses, deque) else deque(responses)
         )
         self.tools_enabled = tools_enabled
         self.call_log = call_log if call_log is not None else []
+        self.message_log = message_log if message_log is not None else []
 
     def bind_tools(self, tools):
         return ScriptedModel(
             self.responses,
             tools_enabled=True,
             call_log=self.call_log,
+            message_log=self.message_log,
         )
 
     def stream(self, messages):
         self.call_log.append(self.tools_enabled)
+        self.message_log.append(list(messages))
         if not self.responses:
             raise AssertionError("ScriptedModel 响应队列已耗尽")
         yield from self.responses.popleft()
@@ -351,3 +363,385 @@ def test_agents_do_not_share_history():
     assert first_model.call_log == [True]
     assert second_model.call_log == []
     assert len(second_model.responses) == 1
+
+
+def test_old_history_is_trimmed_and_current_question_is_kept():
+    model = ScriptedModel(
+        [[AIMessageChunk(content="裁剪后回答。")]]
+    )
+    summary_model = ScriptedModel(
+        [[AIMessageChunk(content="旧历史摘要")]]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[],
+        max_context_tokens=4,
+        token_counter=lambda messages: len(messages),
+        summary_model=summary_model,
+    )
+    agent.messages.extend(
+        [
+            HumanMessage(content="旧问题一"),
+            AIMessage(content="旧回答一"),
+            HumanMessage(content="旧问题二"),
+            AIMessage(content="旧回答二"),
+            HumanMessage(content="最近问题"),
+            AIMessage(content="最近回答"),
+        ]
+    )
+
+    events = list(agent.stream_turn("当前问题"))
+
+    assert isinstance(events[0], ContextTrimmedEvent)
+    assert events[0].removed_message_count == 4
+    assert events[0].remaining_message_count == 4
+    assert events[1] == TokenEvent(text="裁剪后回答。")
+    assert events[2] == MemoryUpdatedEvent(
+        character_count=len("旧历史摘要")
+    )
+    model_messages = model.message_log[0]
+    assert [message.content for message in model_messages] == [
+        agent.messages[0].content,
+        "最近问题",
+        "最近回答",
+        "当前问题",
+    ]
+    assert isinstance(model_messages[-1], HumanMessage)
+    assert model_messages[-1].content == "当前问题"
+    assert agent.messages[-1].content == "裁剪后回答。"
+
+
+def test_tool_history_is_kept_or_removed_as_a_complete_group():
+    def historical_messages():
+        return [
+            HumanMessage(content="历史工具问题"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_test_note",
+                        "args": {},
+                        "id": "historic-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="历史工具结果",
+                tool_call_id="historic-call",
+            ),
+            AIMessage(content="历史最终回答"),
+        ]
+
+    trimmed_model = ScriptedModel(
+        [[AIMessageChunk(content="删除旧工具组后回答。")]]
+    )
+    trimmed_summary_model = ScriptedModel(
+        [[AIMessageChunk(content="历史工具轮次摘要")]]
+    )
+    trimmed_agent = WorkspaceAgent(
+        model=trimmed_model,
+        tools=[],
+        max_context_tokens=5,
+        token_counter=lambda messages: len(messages),
+        summary_model=trimmed_summary_model,
+    )
+    trimmed_agent.messages.extend(historical_messages())
+
+    trimmed_events = list(trimmed_agent.stream_turn("当前问题"))
+
+    assert isinstance(trimmed_events[0], ContextTrimmedEvent)
+    assert trimmed_events[0].removed_message_count == 4
+    assert [type(message) for message in trimmed_model.message_log[0]] == [
+        SystemMessage,
+        HumanMessage,
+    ]
+    assert trimmed_model.message_log[0][-1].content == "当前问题"
+
+    kept_model = ScriptedModel(
+        [[AIMessageChunk(content="保留完整工具组后回答。")]]
+    )
+    kept_agent = WorkspaceAgent(
+        model=kept_model,
+        tools=[],
+        max_context_tokens=6,
+        token_counter=lambda messages: len(messages),
+    )
+    kept_agent.messages.extend(historical_messages())
+
+    kept_events = list(kept_agent.stream_turn("当前问题"))
+
+    assert not any(
+        isinstance(event, ContextTrimmedEvent) for event in kept_events
+    )
+    kept_messages = kept_model.message_log[0]
+    assert [type(message) for message in kept_messages] == [
+        SystemMessage,
+        HumanMessage,
+        AIMessage,
+        ToolMessage,
+        AIMessage,
+        HumanMessage,
+    ]
+    assert kept_messages[2].tool_calls[0]["id"] == "historic-call"
+    assert kept_messages[3].tool_call_id == "historic-call"
+
+
+def test_context_within_budget_does_not_emit_trim_event():
+    model = ScriptedModel(
+        [[AIMessageChunk(content="无需裁剪。")]]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[],
+        max_context_tokens=10,
+        token_counter=lambda messages: len(messages),
+    )
+
+    events = list(agent.stream_turn("短问题"))
+
+    assert events == [TokenEvent(text="无需裁剪。")]
+    assert len(model.message_log) == 1
+    assert [type(message) for message in model.message_log[0]] == [
+        SystemMessage,
+        HumanMessage,
+    ]
+
+
+def test_oversized_current_question_skips_model_and_history_commit():
+    model = ScriptedModel(
+        [[AIMessageChunk(content="不应被调用")]]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[],
+        max_context_tokens=1,
+        token_counter=lambda messages: len(messages),
+    )
+    original_history = agent.messages
+
+    events = list(agent.stream_turn("超出预算的问题"))
+
+    assert len(events) == 1
+    assert isinstance(events[0], SystemEvent)
+    assert "超过上下文预算" in events[0].message
+    assert model.call_log == []
+    assert model.message_log == []
+    assert len(model.responses) == 1
+    assert agent.messages is original_history
+    assert [type(message) for message in agent.messages] == [SystemMessage]
+
+
+def test_trimmed_dialogue_updates_memory_and_injects_context():
+    model = ScriptedModel(
+        [
+            [
+                AIMessageChunk(content="新的"),
+                AIMessageChunk(content="长期摘要"),
+            ],
+            [AIMessageChunk(content="当前回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[],
+        max_context_tokens=4,
+        token_counter=lambda messages: len(messages),
+    )
+    agent.messages.extend(
+        [
+            HumanMessage(content="被删除的旧问题"),
+            AIMessage(content="被删除的旧回答"),
+            HumanMessage(content="保留的最近问题"),
+            AIMessage(content="保留的最近回答"),
+        ]
+    )
+
+    events = list(agent.stream_turn("当前问题"))
+
+    assert isinstance(events[0], ContextTrimmedEvent)
+    assert events[1] == TokenEvent(text="当前回答。")
+    assert events[2] == MemoryUpdatedEvent(
+        character_count=len("新的长期摘要")
+    )
+    assert model.call_log == [False, True]
+    summary_prompt = model.message_log[0][1].content
+    assert "被删除的旧问题" in summary_prompt
+    assert "被删除的旧回答" in summary_prompt
+    assert "保留的最近问题" not in summary_prompt
+    current_context = model.message_log[1]
+    assert "新的长期摘要" in current_context[0].content
+    assert current_context[-1].content == "当前问题"
+    assert agent.memory_summary == "新的长期摘要"
+    assert agent.messages[0].content == current_context[0].content
+
+
+def test_existing_memory_is_used_for_next_summary_update():
+    model = ScriptedModel(
+        [[AIMessageChunk(content="使用更新记忆回答。")]]
+    )
+    summary_output = "更新后的长期摘要内容"
+    summary_model = ScriptedModel(
+        [[AIMessageChunk(content=summary_output)]]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[],
+        max_context_tokens=4,
+        token_counter=lambda messages: len(messages),
+        summary_model=summary_model,
+        max_summary_characters=6,
+    )
+    agent.memory_summary = "已有摘要"
+    agent.messages.extend(
+        [
+            HumanMessage(content="旧问题"),
+            AIMessage(content="旧回答"),
+            HumanMessage(content="最近问题"),
+            AIMessage(content="最近回答"),
+        ]
+    )
+
+    events = list(agent.stream_turn("当前问题"))
+
+    expected_summary = summary_output[:6]
+    summary_prompt = summary_model.message_log[0][1].content
+    assert "已有摘要" in summary_prompt
+    assert "旧问题" in summary_prompt
+    assert "旧回答" in summary_prompt
+    assert agent.memory_summary == expected_summary
+    assert len(agent.memory_summary) == 6
+    assert MemoryUpdatedEvent(character_count=6) in events
+    assert expected_summary in model.message_log[0][0].content
+
+
+def test_raw_tool_results_are_excluded_from_summary_prompt():
+    model = ScriptedModel(
+        [[AIMessageChunk(content="当前回答。")]]
+    )
+    summary_model = ScriptedModel(
+        [[AIMessageChunk(content="安全摘要")]]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[],
+        max_context_tokens=4,
+        token_counter=lambda messages: len(messages),
+        summary_model=summary_model,
+    )
+    agent.messages.extend(
+        [
+            HumanMessage(content="历史工具问题"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_test_note",
+                        "args": {},
+                        "id": "secret-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="SECRET_RAW_TOOL_RESULT",
+                tool_call_id="secret-call",
+            ),
+            AIMessage(content="历史重要结论"),
+            HumanMessage(content="最近问题"),
+            AIMessage(content="最近回答"),
+        ]
+    )
+
+    events = list(agent.stream_turn("当前问题"))
+
+    assert MemoryUpdatedEvent(
+        character_count=len("安全摘要")
+    ) in events
+    summary_messages = summary_model.message_log[0]
+    assert [type(message) for message in summary_messages] == [
+        SystemMessage,
+        HumanMessage,
+    ]
+    summary_prompt = summary_messages[1].content
+    assert "历史工具问题" in summary_prompt
+    assert "历史重要结论" in summary_prompt
+    assert "SECRET_RAW_TOOL_RESULT" not in summary_prompt
+
+
+def test_cancelled_stream_does_not_commit_memory_update():
+    model = ScriptedModel(
+        [[AIMessageChunk(content="尚未提交的当前回答")]]
+    )
+    summary_model = ScriptedModel(
+        [[AIMessageChunk(content="尚未提交的新摘要")]]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[],
+        max_context_tokens=4,
+        token_counter=lambda messages: len(messages),
+        summary_model=summary_model,
+    )
+    agent.memory_summary = "原有摘要"
+    agent.messages.extend(
+        [
+            HumanMessage(content="被删除的问题"),
+            AIMessage(content="被删除的回答"),
+            HumanMessage(content="最近问题"),
+            AIMessage(content="最近回答"),
+        ]
+    )
+    original_history = agent.messages
+
+    stream = agent.stream_turn("当前问题")
+    first_event = next(stream)
+    second_event = next(stream)
+
+    assert isinstance(first_event, ContextTrimmedEvent)
+    assert second_event == TokenEvent(text="尚未提交的当前回答")
+    assert not isinstance(second_event, MemoryUpdatedEvent)
+    assert agent.memory_summary == "原有摘要"
+    assert agent.messages is original_history
+
+    stream.close()
+
+    assert agent.memory_summary == "原有摘要"
+    assert agent.messages is original_history
+    assert model.call_log == [True]
+    assert summary_model.call_log == [False]
+
+
+def test_summary_model_failure_does_not_block_current_answer():
+    model = ScriptedModel(
+        [[AIMessageChunk(content="摘要失败仍正常回答。")]]
+    )
+    summary_model = ScriptedModel([])
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[],
+        max_context_tokens=4,
+        token_counter=lambda messages: len(messages),
+        summary_model=summary_model,
+    )
+    agent.memory_summary = "原有摘要"
+    agent.messages.extend(
+        [
+            HumanMessage(content="被删除的问题"),
+            AIMessage(content="被删除的回答"),
+            HumanMessage(content="最近问题"),
+            AIMessage(content="最近回答"),
+        ]
+    )
+
+    events = list(agent.stream_turn("当前问题"))
+
+    assert isinstance(events[0], ContextTrimmedEvent)
+    assert events[1:] == [TokenEvent(text="摘要失败仍正常回答。")]
+    assert not any(
+        isinstance(event, MemoryUpdatedEvent) for event in events
+    )
+    assert summary_model.call_log == [False]
+    assert model.call_log == [True]
+    assert agent.memory_summary == "原有摘要"
+    assert agent.messages[-1].content == "摘要失败仍正常回答。"

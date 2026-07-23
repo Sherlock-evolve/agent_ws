@@ -6,6 +6,8 @@ from langchain_openai import ChatOpenAI
 
 from agent import (
     AgentEvent,
+    ContextTrimmedEvent,
+    MemoryUpdatedEvent,
     SystemEvent,
     TokenEvent,
     ToolCallEvent,
@@ -66,6 +68,10 @@ def render_event(event: AgentEvent) -> None:
             )
     elif isinstance(event, SystemEvent):
         print(f"[系统] {event.message}")
+    elif isinstance(event, ContextTrimmedEvent):
+        print(f"[上下文] 已移除 {event.removed_message_count} 条旧消息")
+    elif isinstance(event, MemoryUpdatedEvent):
+        print(f"[记忆] 长期摘要已更新，共 {event.character_count} 个字符")
 
 
 def _ensure_line_start() -> None:
