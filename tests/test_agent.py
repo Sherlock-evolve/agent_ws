@@ -19,6 +19,7 @@ import tools as workspace_tools
 from agent import (
     ApprovalDecision,
     ApprovalRequiredEvent,
+    ApprovalResolvedEvent,
     ContextTrimmedEvent,
     MemoryUpdatedEvent,
     SystemEvent,
@@ -136,6 +137,21 @@ def next_envelope_without_metrics(stream):
             ModelCallMetricsEvent,
         ):
             return envelope
+
+
+def send_approval(stream, decision):
+    resolved_event = stream.send(decision)
+    assert isinstance(resolved_event, ApprovalResolvedEvent)
+    return resolved_event, next(stream)
+
+
+def send_enveloped_approval(stream, decision):
+    resolved_envelope = stream.send(decision)
+    assert isinstance(
+        resolved_envelope.event,
+        ApprovalResolvedEvent,
+    )
+    return resolved_envelope, next(stream)
 
 
 class ScriptedClock:
@@ -347,7 +363,8 @@ def test_approved_tool_call_executes_once():
         args={"value": "approved"},
     )
 
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id="approved-call",
             approved=True,
@@ -383,7 +400,8 @@ def test_rejected_tool_call_is_skipped_and_model_continues():
     stream = agent.stream_turn("拒绝受控工具")
     next_without_metrics(stream)
     approval_event = next_without_metrics(stream)
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=False,
@@ -427,7 +445,8 @@ def test_mismatched_approval_id_is_rejected():
     stream = agent.stream_turn("发送错误审批 ID")
     next_without_metrics(stream)
     next_without_metrics(stream)
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id="different-call",
             approved=True,
@@ -446,7 +465,7 @@ def test_mismatched_approval_id_is_rejected():
         for message in agent.messages
         if isinstance(message, ToolMessage)
     )
-    assert "用户未批准" in tool_message.content
+    assert "审批调用 ID 不匹配" in tool_message.content
 
 
 def test_closing_while_waiting_for_approval_rolls_back_and_releases_lock():
@@ -488,6 +507,176 @@ def test_closing_while_waiting_for_approval_rolls_back_and_releases_lock():
         for message in agent.messages
         if isinstance(message, HumanMessage)
     ] == ["下一轮"]
+
+
+def test_approval_resolved_classifies_every_decision_outcome():
+    decisions = [
+        (
+            ApprovalDecision(
+                tool_call_id="classified-call",
+                approved=True,
+            ),
+            "approved",
+            True,
+        ),
+        (
+            ApprovalDecision(
+                tool_call_id="classified-call",
+                approved=False,
+            ),
+            "rejected",
+            False,
+        ),
+        (None, "missing", False),
+        (
+            ApprovalDecision(
+                tool_call_id="EXTERNAL-WRONG-ID",
+                approved=True,
+            ),
+            "mismatched",
+            False,
+        ),
+        ({"approved": True}, "invalid", False),
+        (
+            ApprovalDecision(
+                tool_call_id="classified-call",
+                approved=1,
+            ),
+            "invalid",
+            False,
+        ),
+    ]
+
+    for decision, expected_outcome, should_execute in decisions:
+        ECHO_EXECUTIONS.clear()
+        model = ScriptedModel(
+            [
+                parallel_tool_call_response(
+                    (
+                        "classified-call",
+                        "echo_test",
+                        '{"value":"classified"}',
+                    ),
+                ),
+                [AIMessageChunk(content="审批分类后回答")],
+            ]
+        )
+        agent = WorkspaceAgent(
+            model=model,
+            tools=[echo_test],
+            approval_required_tools={"echo_test"},
+        )
+        stream = agent.stream_turn("分类审批决定")
+        next_without_metrics(stream)
+        required = next_without_metrics(stream)
+
+        resolved, result = send_approval(stream, decision)
+        remaining = list(stream)
+
+        assert isinstance(required, ApprovalRequiredEvent)
+        assert resolved == ApprovalResolvedEvent(
+            tool_call_id="classified-call",
+            tool_name="echo_test",
+            outcome=expected_outcome,
+        )
+        assert result.status == (
+            "success" if should_execute else "skipped"
+        )
+        assert ECHO_EXECUTIONS == (
+            ["classified"] if should_execute else []
+        )
+        assert not any(
+            isinstance(event, ApprovalResolvedEvent)
+            for event in remaining
+        )
+        assert "EXTERNAL-WRONG-ID" not in repr(resolved)
+
+
+def test_approved_resolution_is_emitted_before_tool_execution():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "deferred-approved",
+                    "echo_test",
+                    '{"value":"execute-later"}',
+                ),
+            ),
+            [AIMessageChunk(content="执行后回答")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        approval_required_tools={"echo_test"},
+    )
+    original_history = agent.messages
+    stream = agent.stream_turn("批准后暂停")
+    next_without_metrics(stream)
+    next_without_metrics(stream)
+
+    resolved = stream.send(
+        ApprovalDecision(
+            tool_call_id="deferred-approved",
+            approved=True,
+        )
+    )
+
+    assert resolved.outcome == "approved"
+    assert ECHO_EXECUTIONS == []
+    assert agent.messages is original_history
+
+    result = next(stream)
+
+    assert result.status == "success"
+    assert ECHO_EXECUTIONS == ["execute-later"]
+    list(stream)
+
+
+def test_closing_after_approved_resolution_prevents_execution_and_unlocks():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "close-after-approved",
+                    "echo_test",
+                    '{"value":"must-not-run"}',
+                ),
+            ),
+            [AIMessageChunk(content="锁释放后的新回答")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        approval_required_tools={"echo_test"},
+    )
+    original_history = agent.messages
+    stream = agent.stream_turn("批准后关闭")
+    next_without_metrics(stream)
+    next_without_metrics(stream)
+    resolved = stream.send(
+        ApprovalDecision(
+            tool_call_id="close-after-approved",
+            approved=True,
+        )
+    )
+
+    assert resolved.outcome == "approved"
+    assert ECHO_EXECUTIONS == []
+    assert agent.messages is original_history
+
+    stream.close()
+
+    assert ECHO_EXECUTIONS == []
+    assert agent.messages is original_history
+    assert [type(message) for message in agent.messages] == [SystemMessage]
+    next_events = list(agent.stream_turn("验证锁释放"))
+    assert without_metrics(next_events) == [
+        TokenEvent(text="锁释放后的新回答")
+    ]
 
 
 def test_same_tool_cannot_have_previewer_and_preparer():
@@ -596,7 +785,8 @@ def test_approved_write_atomically_creates_file(
     stream = agent.stream_turn("创建文件")
     assert isinstance(next_without_metrics(stream), ToolCallEvent)
     approval_event = next_without_metrics(stream)
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=True,
@@ -671,7 +861,8 @@ def test_approved_write_overwrites_file_with_correct_preview(
     assert "-旧内容" in approval_event.preview
     assert "+新内容" in approval_event.preview
 
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=True,
@@ -729,7 +920,8 @@ def test_approved_write_preserves_existing_file_mode(
     stream = agent.stream_turn("更新脚本")
     next_without_metrics(stream)
     approval_event = next_without_metrics(stream)
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=True,
@@ -785,7 +977,8 @@ def test_existing_file_change_during_approval_causes_conflict(
     next_without_metrics(stream)
     approval_event = next_without_metrics(stream)
     target_file.write_text("外部程序的新内容\n", encoding="utf-8")
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=True,
@@ -847,7 +1040,8 @@ def test_new_file_created_during_approval_causes_conflict(
     next_without_metrics(stream)
     approval_event = next_without_metrics(stream)
     target_file.write_text("外部程序抢先创建\n", encoding="utf-8")
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=True,
@@ -906,7 +1100,8 @@ def test_prepared_write_succeeds_when_snapshot_is_unchanged(
     stream = agent.stream_turn("更新未变化的脚本")
     next_without_metrics(stream)
     approval_event = next_without_metrics(stream)
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=True,
@@ -962,7 +1157,8 @@ def test_rejected_write_leaves_file_unchanged(
     stream = agent.stream_turn("尝试覆盖文件")
     next_without_metrics(stream)
     approval_event = next_without_metrics(stream)
-    result_event = stream.send(
+    _, result_event = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=False,
@@ -1017,7 +1213,8 @@ def test_approved_write_still_rejects_traversal_and_sensitive_paths(
     stream = agent.stream_turn("尝试非法写入")
     assert isinstance(next_without_metrics(stream), ToolCallEvent)
     first_approval = next_without_metrics(stream)
-    first_result = stream.send(
+    _, first_result = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=first_approval.tool_call_id,
             approved=True,
@@ -1025,7 +1222,8 @@ def test_approved_write_still_rejects_traversal_and_sensitive_paths(
     )
     assert isinstance(next_without_metrics(stream), ToolCallEvent)
     second_approval = next_without_metrics(stream)
-    second_result = stream.send(
+    _, second_result = send_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=second_approval.tool_call_id,
             approved=True,
@@ -2120,7 +2318,8 @@ def test_prepared_action_metrics_cover_success_and_conflict():
         stream = agent.stream_turn("执行准备操作")
         next_without_metrics(stream)
         approval = next_without_metrics(stream)
-        result = stream.send(
+        _, result = send_approval(
+            stream,
             ApprovalDecision(
                 tool_call_id=approval.tool_call_id,
                 approved=True,
@@ -2209,7 +2408,10 @@ def test_unexecuted_tool_results_keep_empty_timing_metrics():
         approval_stream = approval_agent.stream_turn("等待审批")
         next_without_metrics(approval_stream)
         next_without_metrics(approval_stream)
-        approval_result = approval_stream.send(decision)
+        _, approval_result = send_approval(
+            approval_stream,
+            decision,
+        )
         list(approval_stream)
 
         assert approval_result.detail == expected_detail
@@ -2575,12 +2777,14 @@ def test_persistent_session_forwards_approval_decisions(
     stream = session.stream_turn("执行需要审批的工具")
     call_event = next_envelope_without_metrics(stream).event
     approval_event = next_envelope_without_metrics(stream).event
-    result_event = stream.send(
+    _, result_envelope = send_enveloped_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=True,
         )
-    ).event
+    )
+    result_event = result_envelope.event
     remaining_events = list(stream)
 
     assert isinstance(call_event, ToolCallEvent)
@@ -2895,7 +3099,8 @@ def test_event_envelope_forwards_approval_decision(
     metrics_envelope = next(stream)
     call_envelope = next(stream)
     approval_envelope = next(stream)
-    result_envelope = stream.send(
+    resolved_envelope, result_envelope = send_enveloped_approval(
+        stream,
         ApprovalDecision(
             tool_call_id=(
                 approval_envelope.event.tool_call_id
@@ -2908,6 +3113,7 @@ def test_event_envelope_forwards_approval_decision(
         metrics_envelope,
         call_envelope,
         approval_envelope,
+        resolved_envelope,
         result_envelope,
         *remaining,
     ]

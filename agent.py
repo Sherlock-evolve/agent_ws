@@ -20,6 +20,7 @@ from contracts import (
     AgentEvent,
     ApprovalDecision,
     ApprovalRequiredEvent,
+    ApprovalResolvedEvent,
     ContextTrimmedEvent,
     MemoryUpdatedEvent,
     ModelCallMetricsEvent,
@@ -1004,22 +1005,28 @@ class WorkspaceAgent:
                 args=event_args,
                 preview=preview,
             )
-            if (
-                not isinstance(decision, ApprovalDecision)
-                or decision.tool_call_id != tool_call_id
-                or decision.approved is not True
-            ):
-                if (
-                    isinstance(decision, ApprovalDecision)
-                    and decision.tool_call_id != tool_call_id
-                ):
-                    detail = "审批调用 ID 不匹配"
-                else:
-                    detail = "用户未批准"
+            approval_outcome = self._classify_approval_decision(
+                decision,
+                tool_call_id,
+            )
+            yield ApprovalResolvedEvent(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                outcome=approval_outcome,
+            )
+            if approval_outcome != "approved":
+                detail_by_outcome = {
+                    "rejected": "用户未批准",
+                    "missing": "缺少审批决定",
+                    "mismatched": "审批调用 ID 不匹配",
+                    "invalid": "审批决定无效",
+                }
+                detail = detail_by_outcome[approval_outcome]
                 self._append_control_tool_message(
                     messages=working_messages,
                     content=(
-                        f"用户未批准执行工具 {tool_name}，"
+                        f"工具 {tool_name} 的审批结果为"
+                        f"“{detail}”，"
                         "本次调用未执行。请根据已有信息继续回答。"
                     ),
                     tool_call_id=tool_call_id,
@@ -1188,6 +1195,21 @@ class WorkspaceAgent:
         if hasattr(handler, "invoke"):
             return handler.invoke(handler_args)
         return handler(**handler_args)
+
+    @staticmethod
+    def _classify_approval_decision(
+        decision,
+        tool_call_id: str,
+    ) -> str:
+        if decision is None:
+            return "missing"
+        if not isinstance(decision, ApprovalDecision):
+            return "invalid"
+        if decision.tool_call_id != tool_call_id:
+            return "mismatched"
+        if type(decision.approved) is not bool:
+            return "invalid"
+        return "approved" if decision.approved else "rejected"
 
     @staticmethod
     def _validate_tool_arguments(selected_tool, tool_args: dict) -> None:

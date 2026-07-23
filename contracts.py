@@ -37,6 +37,19 @@ class ApprovalRequiredEvent:
 
 
 @dataclass(frozen=True)
+class ApprovalResolvedEvent:
+    tool_call_id: str
+    tool_name: str
+    outcome: Literal[
+        "approved",
+        "rejected",
+        "missing",
+        "mismatched",
+        "invalid",
+    ]
+
+
+@dataclass(frozen=True)
 class ApprovalDecision:
     tool_call_id: str
     approved: bool
@@ -91,6 +104,7 @@ AgentEvent = (
     | ToolCallEvent
     | ToolResultEvent
     | ApprovalRequiredEvent
+    | ApprovalResolvedEvent
     | SystemEvent
     | ContextTrimmedEvent
     | MemoryUpdatedEvent

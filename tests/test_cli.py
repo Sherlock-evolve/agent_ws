@@ -1,5 +1,6 @@
 from collections import deque
 
+import pytest
 from langchain_core.messages import (
     AIMessageChunk,
     HumanMessage,
@@ -8,12 +9,22 @@ from langchain_core.messages import (
 from langchain_core.tools import tool
 
 import main as cli
+import audit_log
 import session_store
 from agent import WorkspaceAgent
 from persistent_session import PersistentSession
 
 
 CLI_TOOL_EXECUTIONS = []
+
+
+@pytest.fixture(autouse=True)
+def isolate_cli_audit_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        audit_log,
+        "AUDIT_LOG_ROOT",
+        tmp_path / ".agent_audit",
+    )
 
 
 @tool
@@ -596,3 +607,19 @@ def test_cli_dirty_mode_blocks_mutations_and_bad_commands_show_help(
     assert "[会话] 当前：current（dirty：是）" in output
     assert output.count("可用命令：") >= 5
     assert "存在未保存状态，请先输入 :retry 或退出" in output
+
+
+def test_cli_renders_safe_approval_resolution(capsys):
+    cli.start_turn()
+    cli.render_event(
+        cli.ApprovalResolvedEvent(
+            tool_call_id="private-call-id",
+            tool_name="write_file",
+            outcome="mismatched",
+        )
+    )
+    cli.finish_turn()
+    output = capsys.readouterr().out
+
+    assert "[审批结果] write_file：调用 ID 不匹配" in output
+    assert "private-call-id" not in output

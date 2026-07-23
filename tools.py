@@ -13,6 +13,7 @@ from contracts import PreparedToolAction, ToolActionConflictError
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
 IGNORED_DIRECTORIES = {
+    ".agent_audit",
     ".agent_sessions",
     ".git",
     ".mypy_cache",

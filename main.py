@@ -8,10 +8,12 @@ from langchain_openai import ChatOpenAI
 
 import session_store
 from agent import WorkspaceAgent
+from audit_log import JsonlAuditLogger
 from contracts import (
     AgentEvent,
     ApprovalDecision,
     ApprovalRequiredEvent,
+    ApprovalResolvedEvent,
     ContextTrimmedEvent,
     EventEnvelope,
     MemoryUpdatedEvent,
@@ -40,6 +42,13 @@ cursor_at_line_start = True
 STATUS_LABELS = {
     "success": "成功",
     "error": "失败",
+}
+APPROVAL_OUTCOME_LABELS = {
+    "approved": "已批准",
+    "rejected": "已拒绝",
+    "missing": "缺少决定",
+    "mismatched": "调用 ID 不匹配",
+    "invalid": "无效决定",
 }
 EXIT_COMMANDS = {"exit", "quit", "退出"}
 HELP_TEXT = """可用命令：
@@ -109,6 +118,12 @@ def render_event(event: AgentEvent) -> None:
         print(f"[审批] 工具 {event.tool_name} 等待用户确认")
         if event.preview:
             print(event.preview)
+    elif isinstance(event, ApprovalResolvedEvent):
+        print(
+            "[审批结果] "
+            f"{event.tool_name}："
+            f"{APPROVAL_OUTCOME_LABELS[event.outcome]}"
+        )
     elif isinstance(event, SystemEvent):
         print(f"[系统] {event.message}")
     elif isinstance(event, ContextTrimmedEvent):
@@ -169,10 +184,12 @@ def create_workspace_agent() -> WorkspaceAgent:
 def _drive_turn(
     session: PersistentSession,
     question: str,
+    audit_logger: JsonlAuditLogger | None = None,
 ) -> None:
     start_turn()
     stream = session.stream_turn(question)
     decision = None
+    audit_warning_shown = False
 
     try:
         while True:
@@ -184,6 +201,14 @@ def _drive_turn(
             decision = None
             if not isinstance(envelope, EventEnvelope):
                 raise TypeError("持久会话返回了无效的事件信封")
+            if audit_logger is not None:
+                try:
+                    audit_logger.record(envelope)
+                except Exception:
+                    if not audit_warning_shown:
+                        _ensure_line_start()
+                        print("[审计警告] 当前轮审计日志写入失败")
+                        audit_warning_shown = True
             event = envelope.event
             render_event(event)
 
@@ -365,6 +390,7 @@ def _handle_command(
 def run_cli(
     session: PersistentSession,
     agent_factory: Callable[[], WorkspaceAgent] | None = None,
+    audit_logger: JsonlAuditLogger | None = None,
 ) -> int:
     if agent_factory is None:
         agent_factory = create_workspace_agent
@@ -391,7 +417,11 @@ def run_cli(
                 print("[会话] 存在未保存状态，请先输入 :retry 或退出")
                 continue
 
-            _drive_turn(session, question)
+            _drive_turn(
+                session,
+                question,
+                audit_logger=audit_logger,
+            )
     except EOFError:
         return _exit_status(session)
     except KeyboardInterrupt:
@@ -426,7 +456,11 @@ def main(argv=None) -> int:
         print(f"[启动失败] {error}")
         return 2
 
-    return run_cli(session, create_workspace_agent)
+    return run_cli(
+        session,
+        create_workspace_agent,
+        audit_logger=JsonlAuditLogger(),
+    )
 
 
 if __name__ == "__main__":
