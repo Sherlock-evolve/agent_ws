@@ -1,10 +1,11 @@
 import argparse
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+from langchain_core.tools import BaseTool
 
 import session_store
 from agent import WorkspaceAgent
@@ -23,6 +24,10 @@ from contracts import (
     TokenEvent,
     ToolCallEvent,
     ToolResultEvent,
+)
+from knowledge_runtime import (
+    KnowledgeRuntime,
+    create_knowledge_runtime,
 )
 from persistent_session import (
     PersistentSession,
@@ -165,20 +170,52 @@ def _ensure_line_start() -> None:
         cursor_at_line_start = True
 
 
-def create_workspace_agent() -> WorkspaceAgent:
+def create_workspace_agent(
+    extra_tools: Iterable[BaseTool] | None = None,
+) -> WorkspaceAgent:
     model = ChatOpenAI(
         model=os.getenv("ZHIPU_MODEL"),
         api_key=os.getenv("ZHIPU_API_KEY"),
         base_url=os.getenv("ZHIPU_BASE_URL"),
         temperature=0,
     )
+    registered_tools = [
+        list_files,
+        read_file,
+        search_text,
+        write_file,
+    ]
+    if extra_tools is not None:
+        registered_tools.extend(tuple(extra_tools))
     agent = WorkspaceAgent(
         model=model,
-        tools=[list_files, read_file, search_text, write_file],
+        tools=registered_tools,
         approval_required_tools={write_file.name},
         approval_preparers={write_file.name: prepare_write_file},
     )
     return agent
+
+
+def create_workspace_agent_factory(
+    extra_tools: Iterable[BaseTool],
+) -> Callable[[], WorkspaceAgent]:
+    shared_tools = tuple(extra_tools)
+
+    def agent_factory() -> WorkspaceAgent:
+        return create_workspace_agent(extra_tools=shared_tools)
+
+    return agent_factory
+
+
+def _show_knowledge_runtime(runtime: KnowledgeRuntime) -> None:
+    corpus_prefix = runtime.corpus_id[:12]
+    print(
+        "[知识库] "
+        f"已索引文件 {runtime.indexed_file_count}，"
+        f"分块 {runtime.chunk_count}，"
+        f"跳过文件 {runtime.skipped_file_count}，"
+        f"corpus_id {corpus_prefix}"
+    )
 
 
 def _drive_turn(
@@ -440,25 +477,59 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         default="default",
         help="持久会话 ID（默认：default）",
     )
+    parser.add_argument(
+        "--enable-knowledge",
+        action="store_true",
+        help="显式启用 docs 语义检索（可能调用外部 Embeddings 服务）",
+    )
+    parser.add_argument(
+        "--knowledge-directory",
+        default="docs",
+        help="工作区内的知识文档目录（默认：docs）",
+    )
     return parser
 
 
-def main(argv=None) -> int:
+def main(
+    argv=None,
+    knowledge_runtime_factory=None,
+) -> int:
     arguments = _build_argument_parser().parse_args(argv)
     load_dotenv()
+
+    runtime = None
+    agent_factory = create_workspace_agent
+    if arguments.enable_knowledge:
+        if knowledge_runtime_factory is None:
+            knowledge_runtime_factory = create_knowledge_runtime
+        try:
+            runtime = knowledge_runtime_factory(
+                knowledge_directory=arguments.knowledge_directory,
+            )
+            if not isinstance(runtime, KnowledgeRuntime):
+                raise TypeError("invalid knowledge runtime")
+            agent_factory = create_workspace_agent_factory(
+                [runtime.search_tool]
+            )
+        except Exception:
+            print("[知识库启动失败] 无法安全初始化知识库")
+            return 2
 
     try:
         session = PersistentSession.open(
             arguments.session,
-            create_workspace_agent,
+            agent_factory,
         )
     except Exception as error:
         print(f"[启动失败] {error}")
         return 2
 
+    if runtime is not None:
+        _show_knowledge_runtime(runtime)
+
     return run_cli(
         session,
-        create_workspace_agent,
+        agent_factory,
         audit_logger=JsonlAuditLogger(),
     )
 
