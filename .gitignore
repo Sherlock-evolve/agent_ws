@@ -5,3 +5,4 @@ __pycache__/
 .vscode/
 .agent_sessions/
 .agent_audit/
+.knowledge_index/

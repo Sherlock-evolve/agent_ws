@@ -127,6 +127,11 @@ class SessionSavedEvent:
     session_id: str
 
 
+@dataclass(frozen=True)
+class TurnCancelledEvent:
+    reason: Literal["user", "client_disconnect", "shutdown"]
+
+
 AgentEvent = (
     TokenEvent
     | ToolCallEvent
@@ -140,6 +145,7 @@ AgentEvent = (
     | CitationPolicyEvent
     | ModelCallMetricsEvent
     | SessionSavedEvent
+    | TurnCancelledEvent
 )
 
 

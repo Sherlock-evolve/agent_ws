@@ -26,6 +26,7 @@ from contracts import (
     TokenEvent,
     ToolCallEvent,
     ToolResultEvent,
+    TurnCancelledEvent,
 )
 from knowledge_runtime import (
     KnowledgeRuntime,
@@ -63,6 +64,8 @@ HELP_TEXT = """可用命令：
   :sessions             按名称列出会话
   :switch <session_id>  切换或新建会话
   :delete <session_id>  删除非当前会话
+  :pending              显示等待恢复的审批
+  :resume               恢复并重新确认审批
   :retry                重试保存未保存状态
   :help                 显示此帮助
   exit / quit / 退出    退出程序"""
@@ -190,6 +193,8 @@ def render_event(event: AgentEvent) -> None:
         )
     elif isinstance(event, SessionSavedEvent):
         print(f"[会话] 已保存：{event.session_id}")
+    elif isinstance(event, TurnCancelledEvent):
+        print(f"[取消] 当前轮次已取消：{event.reason}")
 
 
 def _ensure_line_start() -> None:
@@ -261,6 +266,8 @@ def _show_knowledge_runtime(runtime: KnowledgeRuntime) -> None:
         f"已索引文件 {runtime.indexed_file_count}，"
         f"分块 {runtime.chunk_count}，"
         f"跳过文件 {runtime.skipped_file_count}，"
+        f"复用向量 {runtime.reused_embedding_count}，"
+        f"新增向量 {runtime.created_embedding_count}，"
         f"corpus_id {corpus_prefix}"
     )
 
@@ -270,8 +277,29 @@ def _drive_turn(
     question: str,
     audit_logger: JsonlAuditLogger | None = None,
 ) -> None:
-    start_turn()
     stream = session.stream_turn(question)
+    _drive_event_stream(
+        stream,
+        audit_logger=audit_logger,
+    )
+
+
+def _drive_pending_approval(
+    session: PersistentSession,
+    audit_logger: JsonlAuditLogger | None = None,
+) -> None:
+    stream = session.stream_resume_pending_approval()
+    _drive_event_stream(
+        stream,
+        audit_logger=audit_logger,
+    )
+
+
+def _drive_event_stream(
+    stream,
+    audit_logger: JsonlAuditLogger | None = None,
+) -> None:
+    start_turn()
     decision = None
     audit_warning_shown = False
 
@@ -341,6 +369,8 @@ def _valid_session_id(session_id: str) -> bool:
 def _show_current_session(session: PersistentSession) -> None:
     dirty_state = "是" if session.dirty else "否"
     print(f"[会话] 当前：{session.session_id}（dirty：{dirty_state}）")
+    if session.has_pending_approval:
+        print("[会话] 当前存在待恢复审批")
 
 
 def _show_sessions(session: PersistentSession) -> None:
@@ -355,7 +385,13 @@ def _show_sessions(session: PersistentSession) -> None:
     for session_id in sorted(session_ids):
         if session_id == session.session_id:
             dirty_label = "，dirty" if session.dirty else ""
-            print(f"* {session_id}（当前{dirty_label}）")
+            pending_label = (
+                "，待审批" if session.has_pending_approval else ""
+            )
+            print(
+                f"* {session_id}"
+                f"（当前{dirty_label}{pending_label}）"
+            )
         else:
             print(f"  {session_id}")
 
@@ -373,6 +409,23 @@ def _retry_save(session: PersistentSession) -> None:
         print(f"[保存失败] {error}")
     else:
         print(f"[会话] 重试保存成功：{session.session_id}")
+
+
+def _show_pending_approval(session: PersistentSession) -> None:
+    event = session.pending_approval_event()
+    if event is None:
+        print("[审批恢复] 当前没有待审批轮次")
+        return
+    args_text = json.dumps(
+        event.args,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    print(
+        "[审批恢复] "
+        f"工具 {event.tool_name}，参数 {args_text}；"
+        "输入 :resume 重新生成预览并确认"
+    )
 
 
 def _switch_session(
@@ -433,6 +486,7 @@ def _handle_command(
     session: PersistentSession,
     command_text: str,
     agent_factory: Callable[[], WorkspaceAgent],
+    audit_logger: JsonlAuditLogger | None = None,
 ) -> tuple[bool, PersistentSession]:
     if not command_text.startswith(":"):
         return False, session
@@ -447,6 +501,18 @@ def _handle_command(
         _show_sessions(session)
     elif command == ":retry" and not arguments:
         _retry_save(session)
+    elif command == ":pending" and not arguments:
+        _show_pending_approval(session)
+    elif command == ":resume" and not arguments:
+        if session.dirty:
+            print("[会话] 存在未保存状态，请先输入 :retry")
+        elif not session.has_pending_approval:
+            print("[审批恢复] 当前没有待审批轮次")
+        else:
+            _drive_pending_approval(
+                session,
+                audit_logger=audit_logger,
+            )
     elif command == ":switch" and len(arguments) == 1:
         session_id = arguments[0]
         if not _valid_session_id(session_id):
@@ -493,12 +559,19 @@ def run_cli(
                 session,
                 question,
                 agent_factory,
+                audit_logger=audit_logger,
             )
             if handled:
                 continue
 
             if session.dirty:
                 print("[会话] 存在未保存状态，请先输入 :retry 或退出")
+                continue
+            if session.has_pending_approval:
+                print(
+                    "[审批恢复] 当前会话存在待审批轮次，"
+                    "请先输入 :resume 或切换会话"
+                )
                 continue
 
             _drive_turn(
@@ -592,6 +665,8 @@ def main(
 
     if runtime is not None:
         _show_knowledge_runtime(runtime)
+    if getattr(session, "has_pending_approval", False):
+        _show_pending_approval(session)
 
     return run_cli(
         session,

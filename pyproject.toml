@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workspace-agent"
+version = "0.1.0"
+description = "A safe, persistent and auditable LangChain workspace agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain-core==1.5.0",
+    "langchain-openai==1.4.0",
+    "langchain-text-splitters==1.1.2",
+    "python-dotenv==1.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+]
+
+[project.scripts]
+workspace-agent = "main:main"
+
+[tool.setuptools]
+py-modules = [
+    "agent",
+    "audit_log",
+    "citations",
+    "contracts",
+    "knowledge_base",
+    "knowledge_citation_validator",
+    "knowledge_index",
+    "knowledge_retriever",
+    "knowledge_runtime",
+    "knowledge_tools",
+    "main",
+    "persistent_session",
+    "rag_evaluation",
+    "session_store",
+    "tool_execution",
+    "tools",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-p", "no:launch_pytest",
+    "-p", "no:launch_testing",
+    "-p", "no:launch_ros",
+]

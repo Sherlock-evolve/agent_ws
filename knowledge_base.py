@@ -20,6 +20,7 @@ IGNORED_DIRECTORIES = frozenset(
         ".agent_audit",
         ".agent_sessions",
         ".git",
+        ".knowledge_index",
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",

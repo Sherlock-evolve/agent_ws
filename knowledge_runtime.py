@@ -22,6 +22,11 @@ from knowledge_base import (
     build_knowledge_base,
 )
 from knowledge_citation_validator import validate_knowledge_citations
+from knowledge_index import (
+    CachedEmbeddings,
+    IncrementalEmbeddingIndex,
+    embedding_configuration_fingerprint,
+)
 from knowledge_retriever import KnowledgeRetriever
 from knowledge_tools import create_search_knowledge_tool
 
@@ -33,6 +38,8 @@ class KnowledgeRuntime:
     indexed_file_count: int
     chunk_count: int
     skipped_file_count: int
+    reused_embedding_count: int = 0
+    created_embedding_count: int = 0
     citation_validator: Callable = validate_knowledge_citations
     citation_guard_tool_names: frozenset[str] = frozenset(
         {"search_knowledge"}
@@ -172,9 +179,29 @@ def create_knowledge_runtime(
         ) from None
 
     try:
+        embedding_fingerprint = embedding_configuration_fingerprint(
+            model=configuration["model"],
+            base_url=configuration["base_url"],
+        )
+        index_cache = IncrementalEmbeddingIndex(
+            workspace_root=workspace_root,
+            knowledge_directory=knowledge_directory,
+            embedding_fingerprint=embedding_fingerprint,
+        )
+        cached_embeddings = CachedEmbeddings(
+            embeddings,
+            index_cache,
+        )
         retriever = retriever_factory(
             chunks=build_result.chunks,
-            embeddings=embeddings,
+            embeddings=cached_embeddings,
+        )
+        cached_embeddings.commit(
+            [
+                chunk.page_content
+                for chunk in build_result.chunks
+            ],
+            retriever.corpus_id,
         )
         search_tool = search_tool_factory(retriever)
     except Exception:
@@ -188,4 +215,6 @@ def create_knowledge_runtime(
         indexed_file_count=len(build_result.indexed_files),
         chunk_count=len(build_result.chunks),
         skipped_file_count=len(build_result.skipped_files),
+        reused_embedding_count=cached_embeddings.reused_count,
+        created_embedding_count=cached_embeddings.created_count,
     )

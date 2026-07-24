@@ -20,6 +20,7 @@ from contracts import (
     TokenEvent,
     ToolCallEvent,
     ToolResultEvent,
+    TurnCancelledEvent,
 )
 
 
@@ -240,6 +241,16 @@ class JsonlAuditLogger:
         if isinstance(event, SessionSavedEvent):
             return "SessionSavedEvent", {
                 "saved": True,
+            }
+        if isinstance(event, TurnCancelledEvent):
+            if event.reason not in {
+                "user",
+                "client_disconnect",
+                "shutdown",
+            }:
+                raise AuditLogError("取消原因不在允许范围内")
+            return "TurnCancelledEvent", {
+                "reason": event.reason,
             }
         raise UnsupportedAuditEventError(
             "事件类型不在审计白名单中"

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import time
 from collections.abc import Callable, Generator
@@ -34,6 +35,14 @@ from contracts import (
     ToolActionConflictError,
     ToolCallEvent,
     ToolResultEvent,
+    TurnCancelledEvent,
+)
+from tool_execution import (
+    CancellationToken,
+    ToolExecutionCancelled,
+    ToolExecutionMiddleware,
+    ToolExecutionPolicy,
+    ToolExecutionTimeout,
 )
 
 
@@ -44,6 +53,7 @@ SYSTEM_PROMPT = (
 )
 TOOL_RESULT_TRUNCATION_MARKER = "\n[工具结果已截断]"
 SNAPSHOT_VERSION = 1
+PENDING_APPROVAL_VERSION = 1
 REDACTED_ARGUMENT_NAMES = {
     "api_key",
     "content",
@@ -115,6 +125,11 @@ class WorkspaceAgent:
             "require_valid",
         ] = "observe",
         citation_guard_tool_names: set[str] | None = None,
+        tool_execution_middleware: ToolExecutionMiddleware | None = None,
+        tool_execution_policies: (
+            dict[str, ToolExecutionPolicy] | None
+        ) = None,
+        default_tool_timeout_seconds: float | None = 30.0,
     ):
         configured_previewers = dict(approval_previewers or {})
         configured_preparers = dict(approval_preparers or {})
@@ -176,10 +191,51 @@ class WorkspaceAgent:
         self.citation_policy = citation_policy
         self.citation_guard_tool_names = configured_guard_tool_names
         self.tools_by_name = {tool.name: tool for tool in self.tools}
+        if len(self.tools_by_name) != len(self.tools):
+            raise ValueError("工具名称必须唯一")
+        if (
+            tool_execution_middleware is not None
+            and tool_execution_policies is not None
+        ):
+            raise ValueError(
+                "不能同时配置 tool_execution_middleware "
+                "和 tool_execution_policies"
+            )
+        if tool_execution_middleware is None:
+            configured_execution_policies = dict(
+                tool_execution_policies or {}
+            )
+            for tool_name in self.approval_required_tools:
+                configured_execution_policies.setdefault(
+                    tool_name,
+                    ToolExecutionPolicy(
+                        risk="workspace_write",
+                        timeout_seconds=None,
+                        abandon_on_cancel=False,
+                    ),
+                )
+            tool_execution_middleware = ToolExecutionMiddleware(
+                configured_execution_policies,
+                default_policy=ToolExecutionPolicy(
+                    risk="read_only",
+                    timeout_seconds=default_tool_timeout_seconds,
+                    abandon_on_cancel=True,
+                ),
+            )
+        if not isinstance(
+            tool_execution_middleware,
+            ToolExecutionMiddleware,
+        ):
+            raise TypeError(
+                "tool_execution_middleware 必须是 ToolExecutionMiddleware"
+            )
+        self.tool_execution_middleware = tool_execution_middleware
         self.model_with_tools = self.model.bind_tools(self.tools)
         self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
         self.memory_summary = ""
         self._turn_lock = Lock()
+        self._active_cancellation_token = None
+        self._pending_approval = None
 
     def export_snapshot(self) -> dict:
         """导出当前已提交会话状态的 JSON 可序列化副本。"""
@@ -212,6 +268,10 @@ class WorkspaceAgent:
             raise RuntimeError("事件流活跃时不能恢复会话快照")
 
         try:
+            if self._pending_approval is not None:
+                raise RuntimeError(
+                    "存在待审批轮次时不能恢复会话快照"
+                )
             restored_messages, restored_summary = (
                 self._validate_snapshot(snapshot)
             )
@@ -320,11 +380,29 @@ class WorkspaceAgent:
         """运行一轮并产生事件；提前停止消费时应关闭返回的生成器。"""
         if not self._turn_lock.acquire(blocking=False):
             raise RuntimeError("同一 WorkspaceAgent 不能同时运行多个对话轮次")
-
-        try:
-            yield from self._run_turn_transaction(question)
-        finally:
+        if self._pending_approval is not None:
             self._turn_lock.release()
+            raise RuntimeError("当前存在待恢复审批，不能开始新轮次")
+
+        cancellation_token = CancellationToken()
+        self._active_cancellation_token = cancellation_token
+        try:
+            try:
+                yield from self._run_turn_transaction(question)
+            except ToolExecutionCancelled:
+                yield TurnCancelledEvent(
+                    reason=cancellation_token.reason,
+                )
+        finally:
+            self._active_cancellation_token = None
+            self._turn_lock.release()
+
+    def cancel_active_turn(self, reason: str = "user") -> bool:
+        """请求取消当前轮次；没有活跃轮次时返回 False。"""
+        cancellation_token = self._active_cancellation_token
+        if cancellation_token is None:
+            return False
+        return cancellation_token.cancel(reason)
 
     def _run_turn_transaction(
         self,
@@ -395,10 +473,27 @@ class WorkspaceAgent:
         current_turn_start_index = len(working_messages) - 1
 
         state = _TurnState()
+        yield from self._continue_turn_transaction(
+            working_messages=working_messages,
+            working_summary=working_summary,
+            current_turn_start_index=current_turn_start_index,
+            state=state,
+            start_step=1,
+        )
+
+    def _continue_turn_transaction(
+        self,
+        *,
+        working_messages: list,
+        working_summary: str,
+        current_turn_start_index: int,
+        state: _TurnState,
+        start_step: int,
+    ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
         answered = False
         task_stopped = False
 
-        for step in range(1, self.max_agent_loops + 1):
+        for step in range(start_step, self.max_agent_loops + 1):
             tools_allowed = (
                 step < self.max_agent_loops
                 and not state.tool_budget_exhausted
@@ -418,6 +513,7 @@ class WorkspaceAgent:
                 active_model,
                 working_messages,
                 call_index=state.model_call_count,
+                cancellation_token=self._active_cancellation_token,
             )
             if buffer_candidate:
                 try:
@@ -501,13 +597,19 @@ class WorkspaceAgent:
             if buffer_candidate:
                 yield from buffered_events
 
-            for tool_call in response.tool_calls:
-                yield from self._execute_tool_call(
+            tool_calls = list(response.tool_calls)
+            for tool_index, tool_call in enumerate(tool_calls):
+                state_before = self._copy_turn_state(state)
+                yield from self._execute_tool_call_with_recovery(
                     tool_call=tool_call,
+                    remaining_tool_calls=tool_calls[tool_index + 1 :],
                     step=step,
                     tools_allowed=tools_allowed,
                     state=state,
+                    state_before=state_before,
                     working_messages=working_messages,
+                    working_summary=working_summary,
+                    current_turn_start_index=current_turn_start_index,
                 )
 
         if not answered and not task_stopped:
@@ -517,6 +619,522 @@ class WorkspaceAgent:
                     "已停止。"
                 )
             )
+
+    def _execute_tool_call_with_recovery(
+        self,
+        *,
+        tool_call: dict,
+        remaining_tool_calls: list[dict],
+        step: int,
+        tools_allowed: bool,
+        state: _TurnState,
+        state_before: _TurnState,
+        working_messages: list,
+        working_summary: str,
+        current_turn_start_index: int,
+    ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
+        tool_stream = self._execute_tool_call(
+            tool_call=tool_call,
+            step=step,
+            tools_allowed=tools_allowed,
+            state=state,
+            working_messages=working_messages,
+        )
+        decision = None
+        completed = False
+
+        try:
+            while True:
+                try:
+                    event = tool_stream.send(decision)
+                except StopIteration:
+                    completed = True
+                    return
+
+                decision = None
+                if isinstance(event, ApprovalRequiredEvent):
+                    if tool_call["name"] in self.approval_preparers:
+                        self._pending_approval = (
+                            self._build_pending_approval_record(
+                                working_messages=working_messages,
+                                working_summary=working_summary,
+                                current_turn_start_index=(
+                                    current_turn_start_index
+                                ),
+                                step=step,
+                                tools_allowed=tools_allowed,
+                                state=state_before,
+                                tool_call=tool_call,
+                                remaining_tool_calls=remaining_tool_calls,
+                            )
+                        )
+                elif isinstance(event, ApprovalResolvedEvent):
+                    self._pending_approval = None
+
+                decision = yield event
+        finally:
+            if not completed:
+                tool_stream.close()
+
+    @staticmethod
+    def _copy_turn_state(state: _TurnState) -> _TurnState:
+        return _TurnState(
+            model_call_count=state.model_call_count,
+            tool_call_count=state.tool_call_count,
+            seen_tool_calls=set(state.seen_tool_calls),
+            tool_budget_exhausted=state.tool_budget_exhausted,
+            tool_result_character_count=(
+                state.tool_result_character_count
+            ),
+            tool_result_budget_exhausted=(
+                state.tool_result_budget_exhausted
+            ),
+        )
+
+    @staticmethod
+    def _serialize_turn_state(state: _TurnState) -> dict:
+        return {
+            "model_call_count": state.model_call_count,
+            "tool_call_count": state.tool_call_count,
+            "seen_tool_calls": [
+                list(signature)
+                for signature in sorted(state.seen_tool_calls)
+            ],
+            "tool_budget_exhausted": state.tool_budget_exhausted,
+            "tool_result_character_count": (
+                state.tool_result_character_count
+            ),
+            "tool_result_budget_exhausted": (
+                state.tool_result_budget_exhausted
+            ),
+        }
+
+    @staticmethod
+    def _restore_turn_state(payload: dict) -> _TurnState:
+        required_keys = {
+            "model_call_count",
+            "tool_call_count",
+            "seen_tool_calls",
+            "tool_budget_exhausted",
+            "tool_result_character_count",
+            "tool_result_budget_exhausted",
+        }
+        if not isinstance(payload, dict) or set(payload) != required_keys:
+            raise ValueError("待审批轮次状态字段非法")
+        integer_fields = (
+            "model_call_count",
+            "tool_call_count",
+            "tool_result_character_count",
+        )
+        if any(
+            type(payload[name]) is not int or payload[name] < 0
+            for name in integer_fields
+        ):
+            raise ValueError("待审批轮次计数非法")
+        boolean_fields = (
+            "tool_budget_exhausted",
+            "tool_result_budget_exhausted",
+        )
+        if any(
+            type(payload[name]) is not bool
+            for name in boolean_fields
+        ):
+            raise ValueError("待审批轮次预算状态非法")
+
+        raw_signatures = payload["seen_tool_calls"]
+        if not isinstance(raw_signatures, list):
+            raise ValueError("待审批重复调用状态非法")
+        signatures = set()
+        for raw_signature in raw_signatures:
+            if (
+                not isinstance(raw_signature, list)
+                or len(raw_signature) != 2
+                or any(
+                    not isinstance(value, str)
+                    for value in raw_signature
+                )
+            ):
+                raise ValueError("待审批重复调用签名非法")
+            signatures.add(tuple(raw_signature))
+        if len(signatures) != len(raw_signatures):
+            raise ValueError("待审批重复调用签名重复")
+
+        return _TurnState(
+            model_call_count=payload["model_call_count"],
+            tool_call_count=payload["tool_call_count"],
+            seen_tool_calls=signatures,
+            tool_budget_exhausted=payload["tool_budget_exhausted"],
+            tool_result_character_count=(
+                payload["tool_result_character_count"]
+            ),
+            tool_result_budget_exhausted=(
+                payload["tool_result_budget_exhausted"]
+            ),
+        )
+
+    def _committed_snapshot_hash(self) -> str:
+        snapshot = {
+            "version": SNAPSHOT_VERSION,
+            "messages": messages_to_dict(self.messages),
+            "memory_summary": self.memory_summary,
+        }
+        encoded = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _build_pending_approval_record(
+        self,
+        *,
+        working_messages: list,
+        working_summary: str,
+        current_turn_start_index: int,
+        step: int,
+        tools_allowed: bool,
+        state: _TurnState,
+        tool_call: dict,
+        remaining_tool_calls: list[dict],
+    ) -> dict:
+        record = {
+            "version": PENDING_APPROVAL_VERSION,
+            "base_snapshot_sha256": self._committed_snapshot_hash(),
+            "working_messages": messages_to_dict(working_messages),
+            "working_summary": working_summary,
+            "current_turn_start_index": current_turn_start_index,
+            "step": step,
+            "tools_allowed": tools_allowed,
+            "turn_state": self._serialize_turn_state(state),
+            "tool_call": deepcopy(tool_call),
+            "remaining_tool_calls": deepcopy(remaining_tool_calls),
+        }
+        return json.loads(json.dumps(record, ensure_ascii=False))
+
+    def export_pending_approval(self) -> dict | None:
+        """导出最近一次可恢复审批；预览需在恢复时重新生成。"""
+        if self._pending_approval is None:
+            return None
+        return deepcopy(self._pending_approval)
+
+    @property
+    def has_pending_approval(self) -> bool:
+        return self._pending_approval is not None
+
+    def pending_approval_event(self) -> ApprovalRequiredEvent | None:
+        """返回不含预览和原始敏感参数的待审批摘要。"""
+        if self._pending_approval is None:
+            return None
+        tool_call = self._pending_approval["tool_call"]
+        return ApprovalRequiredEvent(
+            tool_call_id=tool_call["id"],
+            tool_name=tool_call["name"],
+            args=_freeze(
+                self._redact_tool_args(tool_call["args"])
+            ),
+            preview="",
+        )
+
+    def restore_pending_approval(self, record: dict) -> None:
+        """验证并恢复一个未提交、等待重新审批的轮次。"""
+        if not self._turn_lock.acquire(blocking=False):
+            raise RuntimeError("事件流活跃时不能恢复待审批轮次")
+        try:
+            restored = self._validate_pending_approval(record)
+            self._pending_approval = restored
+        finally:
+            self._turn_lock.release()
+
+    def _validate_pending_approval(self, record: dict) -> dict:
+        if not isinstance(record, dict):
+            raise ValueError("待审批记录必须是字典")
+        try:
+            candidate = deepcopy(record)
+        except Exception as error:
+            raise ValueError("无法复制待审批记录") from error
+
+        required_keys = {
+            "version",
+            "base_snapshot_sha256",
+            "working_messages",
+            "working_summary",
+            "current_turn_start_index",
+            "step",
+            "tools_allowed",
+            "turn_state",
+            "tool_call",
+            "remaining_tool_calls",
+        }
+        if set(candidate) != required_keys:
+            raise ValueError("待审批记录字段不完整或包含未知字段")
+        if (
+            type(candidate["version"]) is not int
+            or candidate["version"] != PENDING_APPROVAL_VERSION
+        ):
+            raise ValueError("不支持的待审批记录版本")
+        base_snapshot_sha256 = candidate["base_snapshot_sha256"]
+        if (
+            not isinstance(base_snapshot_sha256, str)
+            or len(base_snapshot_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in base_snapshot_sha256
+            )
+            or base_snapshot_sha256
+            != self._committed_snapshot_hash()
+        ):
+            raise ValueError("待审批记录对应的会话状态已经变化")
+        summary = candidate["working_summary"]
+        if (
+            not isinstance(summary, str)
+            or len(summary) > self.max_summary_characters
+        ):
+            raise ValueError("待审批长期摘要非法")
+
+        try:
+            working_messages = messages_from_dict(
+                candidate["working_messages"]
+            )
+        except Exception as error:
+            raise ValueError("待审批消息无法反序列化") from error
+        current_index = candidate["current_turn_start_index"]
+        if (
+            type(current_index) is not int
+            or current_index < 1
+            or current_index >= len(working_messages)
+            or not isinstance(
+                working_messages[current_index],
+                HumanMessage,
+            )
+            or not isinstance(working_messages[0], SystemMessage)
+        ):
+            raise ValueError("待审批当前轮次位置非法")
+        if not self._is_current_system_message(
+            working_messages[0],
+            summary,
+        ):
+            raise ValueError("待审批系统消息非法")
+        if any(
+            not isinstance(
+                message,
+                (SystemMessage, HumanMessage, AIMessage, ToolMessage),
+            )
+            for message in working_messages
+        ):
+            raise ValueError("待审批消息类型非法")
+        if any(
+            isinstance(message, SystemMessage)
+            for message in working_messages[1:]
+        ) or any(
+            isinstance(message, HumanMessage)
+            for message in working_messages[current_index + 1 :]
+        ):
+            raise ValueError("待审批消息轮次结构非法")
+
+        step = candidate["step"]
+        if (
+            type(step) is not int
+            or step < 1
+            or step >= self.max_agent_loops
+            or candidate["tools_allowed"] is not True
+        ):
+            raise ValueError("待审批 Agent 步骤非法")
+        state = self._restore_turn_state(candidate["turn_state"])
+        if (
+            state.model_call_count < step
+            or state.tool_call_count > self.max_tool_calls
+            or state.tool_result_character_count
+            > self.max_tool_result_characters
+        ):
+            raise ValueError("待审批模型调用计数非法")
+
+        tool_call = self._validate_pending_tool_call(
+            candidate["tool_call"],
+            require_recoverable=True,
+        )
+        remaining_tool_calls = [
+            self._validate_pending_tool_call(
+                pending_call,
+                require_recoverable=False,
+            )
+            for pending_call in candidate["remaining_tool_calls"]
+        ] if isinstance(candidate["remaining_tool_calls"], list) else None
+        if remaining_tool_calls is None:
+            raise ValueError("待审批剩余工具调用非法")
+
+        unresolved_ids = [
+            tool_call["id"],
+            *(call["id"] for call in remaining_tool_calls),
+        ]
+        if len(set(unresolved_ids)) != len(unresolved_ids):
+            raise ValueError("待审批工具调用 ID 重复")
+        matching_ai_message = next(
+            (
+                message
+                for message in reversed(
+                    working_messages[current_index + 1 :]
+                )
+                if (
+                    isinstance(message, AIMessage)
+                    and message.tool_calls
+                    and all(
+                        call_id
+                        in {
+                            call["id"]
+                            for call in message.tool_calls
+                        }
+                        for call_id in unresolved_ids
+                    )
+                )
+            ),
+            None,
+        )
+        if matching_ai_message is None:
+            raise ValueError("待审批消息缺少对应工具调用")
+        full_calls = [
+            {
+                "id": call["id"],
+                "name": call["name"],
+                "args": call["args"],
+            }
+            for call in matching_ai_message.tool_calls
+        ]
+        current_call_index = next(
+            (
+                index
+                for index, call in enumerate(full_calls)
+                if call["id"] == tool_call["id"]
+            ),
+            None,
+        )
+        expected_unresolved_calls = [
+            {
+                "id": call["id"],
+                "name": call["name"],
+                "args": call["args"],
+            }
+            for call in [tool_call, *remaining_tool_calls]
+        ]
+        if (
+            current_call_index is None
+            or full_calls[current_call_index:]
+            != expected_unresolved_calls
+        ):
+            raise ValueError("待审批工具调用与消息记录不一致")
+        completed_ids = {
+            message.tool_call_id
+            for message in working_messages
+            if isinstance(message, ToolMessage)
+        }
+        if any(call_id in completed_ids for call_id in unresolved_ids):
+            raise ValueError("待审批工具调用已经存在结果")
+
+        candidate["working_messages"] = messages_to_dict(
+            working_messages
+        )
+        candidate["tool_call"] = tool_call
+        candidate["remaining_tool_calls"] = remaining_tool_calls
+        candidate["turn_state"] = self._serialize_turn_state(state)
+        return json.loads(json.dumps(candidate, ensure_ascii=False))
+
+    def _validate_pending_tool_call(
+        self,
+        tool_call,
+        *,
+        require_recoverable: bool,
+    ) -> dict:
+        if (
+            not isinstance(tool_call, dict)
+            or not isinstance(tool_call.get("id"), str)
+            or not tool_call["id"]
+            or not isinstance(tool_call.get("name"), str)
+            or not tool_call["name"]
+            or not isinstance(tool_call.get("args"), dict)
+        ):
+            raise ValueError("待审批工具调用非法")
+        tool_name = tool_call["name"]
+        selected_tool = self.tools_by_name.get(tool_name)
+        if selected_tool is None:
+            raise ValueError("待审批工具不再可用")
+        self._validate_tool_arguments(
+            selected_tool,
+            tool_call["args"],
+        )
+        if require_recoverable and (
+            tool_name not in self.approval_required_tools
+            or tool_name not in self.approval_preparers
+        ):
+            raise ValueError("待审批工具不支持安全恢复")
+        return deepcopy(tool_call)
+
+    def stream_resume_pending_approval(
+        self,
+    ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
+        """重新准备预览、获取新审批并继续未提交轮次。"""
+        if not self._turn_lock.acquire(blocking=False):
+            raise RuntimeError("同一 WorkspaceAgent 不能同时运行多个对话轮次")
+        if self._pending_approval is None:
+            self._turn_lock.release()
+            raise RuntimeError("当前没有可恢复的待审批轮次")
+
+        cancellation_token = CancellationToken()
+        self._active_cancellation_token = cancellation_token
+        try:
+            try:
+                yield from self._run_pending_approval_transaction(
+                    deepcopy(self._pending_approval)
+                )
+            except ToolExecutionCancelled:
+                yield TurnCancelledEvent(
+                    reason=cancellation_token.reason,
+                )
+        finally:
+            self._active_cancellation_token = None
+            self._turn_lock.release()
+
+    def _run_pending_approval_transaction(
+        self,
+        record: dict,
+    ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
+        record = self._validate_pending_approval(record)
+        working_messages = messages_from_dict(
+            record["working_messages"]
+        )
+        working_summary = record["working_summary"]
+        current_turn_start_index = record[
+            "current_turn_start_index"
+        ]
+        state = self._restore_turn_state(record["turn_state"])
+        step = record["step"]
+        tools_allowed = record["tools_allowed"]
+        tool_calls = [
+            record["tool_call"],
+            *record["remaining_tool_calls"],
+        ]
+
+        for tool_index, tool_call in enumerate(tool_calls):
+            state_before = self._copy_turn_state(state)
+            yield from self._execute_tool_call_with_recovery(
+                tool_call=tool_call,
+                remaining_tool_calls=tool_calls[tool_index + 1 :],
+                step=step,
+                tools_allowed=tools_allowed,
+                state=state,
+                state_before=state_before,
+                working_messages=working_messages,
+                working_summary=working_summary,
+                current_turn_start_index=current_turn_start_index,
+            )
+
+        yield from self._continue_turn_transaction(
+            working_messages=working_messages,
+            working_summary=working_summary,
+            current_turn_start_index=current_turn_start_index,
+            state=state,
+            start_step=step + 1,
+        )
 
     def _validate_current_turn_citations(
         self,
@@ -712,13 +1330,20 @@ class WorkspaceAgent:
 
         try:
             summary_parts = []
+            cancellation_token = self._active_cancellation_token
+            if cancellation_token is not None:
+                cancellation_token.raise_if_cancelled()
             for chunk in self.summary_model.stream(summary_messages):
+                if cancellation_token is not None:
+                    cancellation_token.raise_if_cancelled()
                 if isinstance(chunk.content, str):
                     text = chunk.content
                 else:
                     text = chunk.text
                 if text:
                     summary_parts.append(text)
+        except ToolExecutionCancelled:
+            raise
         except Exception:
             return None
 
@@ -865,13 +1490,16 @@ class WorkspaceAgent:
         active_model,
         working_messages: list,
         call_index: int,
+        cancellation_token: CancellationToken,
     ) -> Generator[AgentEvent, None, AIMessage | None]:
         response_chunk = None
         started_at = self.monotonic_clock()
         first_chunk_at = None
 
         try:
+            cancellation_token.raise_if_cancelled()
             for chunk in active_model.stream(working_messages):
+                cancellation_token.raise_if_cancelled()
                 if first_chunk_at is None:
                     first_chunk_at = self.monotonic_clock()
 
@@ -1230,9 +1858,64 @@ class WorkspaceAgent:
         execution_started_at = self.monotonic_clock()
         try:
             if prepared_action is not None:
-                raw_tool_result = prepared_action.execute()
+                action = prepared_action.execute
             else:
-                raw_tool_result = selected_tool.invoke(internal_args)
+                action = lambda: selected_tool.invoke(internal_args)
+            cancellation_token = self._active_cancellation_token
+            if cancellation_token is None:
+                raise ToolExecutionCancelled(
+                    "The active turn is no longer available."
+                )
+            raw_tool_result = self.tool_execution_middleware.execute(
+                tool_name,
+                action,
+                cancellation_token,
+            )
+        except ToolExecutionCancelled:
+            execution_finished_at = self.monotonic_clock()
+            self._append_control_tool_message(
+                messages=working_messages,
+                content="当前轮次已取消，本次工具调用未完成。",
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+            )
+            yield ToolResultEvent(
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                status="skipped",
+                character_count=0,
+                detail="轮次已取消",
+                duration_ms=self._elapsed_ms(
+                    execution_started_at,
+                    execution_finished_at,
+                ),
+                error_type=ToolExecutionCancelled.__name__,
+            )
+            raise
+        except ToolExecutionTimeout:
+            execution_finished_at = self.monotonic_clock()
+            self._append_control_tool_message(
+                messages=working_messages,
+                content=(
+                    "工具执行超过允许时间，本次调用未获得结果。"
+                    "请根据已有信息回答或稍后重试。"
+                ),
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+            )
+            yield ToolResultEvent(
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                status="error",
+                character_count=0,
+                detail="工具执行超时",
+                duration_ms=self._elapsed_ms(
+                    execution_started_at,
+                    execution_finished_at,
+                ),
+                error_type=ToolExecutionTimeout.__name__,
+            )
+            return
         except ToolActionConflictError as error:
             execution_finished_at = self.monotonic_clock()
             self._append_control_tool_message(
