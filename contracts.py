@@ -82,6 +82,21 @@ class MemoryUpdatedEvent:
 
 
 @dataclass(frozen=True)
+class CitationValidationEvent:
+    status: Literal[
+        "valid",
+        "missing",
+        "unknown",
+        "not_applicable",
+        "error",
+    ]
+    citation_count: int
+    valid_citation_count: int
+    unknown_citation_count: int
+    retrieved_chunk_count: int
+
+
+@dataclass(frozen=True)
 class ModelCallMetricsEvent:
     call_index: int
     status: Literal["success", "error"]
@@ -108,6 +123,7 @@ AgentEvent = (
     | SystemEvent
     | ContextTrimmedEvent
     | MemoryUpdatedEvent
+    | CitationValidationEvent
     | ModelCallMetricsEvent
     | SessionSavedEvent
 )

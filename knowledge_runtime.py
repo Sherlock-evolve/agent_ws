@@ -21,6 +21,7 @@ from knowledge_base import (
     KnowledgeBuildResult,
     build_knowledge_base,
 )
+from knowledge_citation_validator import validate_knowledge_citations
 from knowledge_retriever import KnowledgeRetriever
 from knowledge_tools import create_search_knowledge_tool
 
@@ -32,6 +33,7 @@ class KnowledgeRuntime:
     indexed_file_count: int
     chunk_count: int
     skipped_file_count: int
+    citation_validator: Callable = validate_knowledge_citations
 
 
 class KnowledgeRuntimeError(RuntimeError):

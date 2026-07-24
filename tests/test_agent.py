@@ -291,6 +291,7 @@ def test_tool_call_then_answer():
         AIMessage,
     ]
     assert agent.messages[3].tool_call_id == "call-1"
+    assert agent.messages[3].name == "read_test_note"
     assert agent.messages[3].content == "测试笔记内容"
     assert list(model.responses) == []
 
@@ -418,6 +419,7 @@ def test_rejected_tool_call_is_skipped_and_model_continues():
     assert result_event.detail == "用户未批准"
     assert ECHO_EXECUTIONS == []
     assert len(tool_messages) == 1
+    assert tool_messages[0].name == "echo_test"
     assert "用户未批准" in tool_messages[0].content
     assert tool_messages[0].content != ""
     assert without_metrics(remaining_events) == [

@@ -21,6 +21,7 @@ from contracts import (
     ApprovalDecision,
     ApprovalRequiredEvent,
     ApprovalResolvedEvent,
+    CitationValidationEvent,
     ContextTrimmedEvent,
     EventEnvelope,
     MemoryUpdatedEvent,
@@ -101,6 +102,13 @@ def test_audit_whitelists_every_known_event_type_and_rejects_unknown(
             remaining_message_count=4,
         ),
         MemoryUpdatedEvent(character_count=90),
+        CitationValidationEvent(
+            status="valid",
+            citation_count=2,
+            valid_citation_count=2,
+            unknown_citation_count=0,
+            retrieved_chunk_count=3,
+        ),
         ModelCallMetricsEvent(
             call_index=2,
             status="success",
@@ -162,6 +170,18 @@ def test_audit_whitelists_every_known_event_type_and_rejects_unknown(
         "outcome",
     }
     assert set(records[5]["data"]) == {"character_count"}
+    citation_record = next(
+        record
+        for record in records
+        if record["event_type"] == "CitationValidationEvent"
+    )
+    assert set(citation_record["data"]) == {
+        "status",
+        "citation_count",
+        "valid_citation_count",
+        "unknown_citation_count",
+        "retrieved_chunk_count",
+    }
 
     @dataclass(frozen=True)
     class UnknownEvent:

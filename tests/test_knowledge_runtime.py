@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import deque
 
 import pytest
@@ -215,10 +216,11 @@ def test_enabled_runtime_builds_once_registers_tool_and_uses_fallbacks(
             knowledge_builder=knowledge_builder,
         )
 
-    def agent_factory(extra_tools=None):
+    def agent_factory(extra_tools=None, citation_validator=None):
         agent = WorkspaceAgent(
             model=ScriptedModel([]),
             tools=list(extra_tools or ()),
+            citation_validator=citation_validator,
         )
         created_agents.append(agent)
         return agent
@@ -276,7 +278,7 @@ def test_session_switches_share_tool_but_not_agent_history(
         runtime_calls.append(kwargs)
         return runtime
 
-    def agent_factory(extra_tools=None):
+    def agent_factory(extra_tools=None, citation_validator=None):
         responses = (
             [[AIMessageChunk(content="第一个会话回答")]]
             if not created_agents
@@ -285,6 +287,7 @@ def test_session_switches_share_tool_but_not_agent_history(
         agent = WorkspaceAgent(
             model=ScriptedModel(responses),
             tools=list(extra_tools or ()),
+            citation_validator=citation_validator,
         )
         created_agents.append(agent)
         return agent
@@ -461,11 +464,12 @@ def test_cli_rag_round_trip_persists_citation_and_audits_no_body(
     )
     created_agents = []
 
-    def agent_factory(extra_tools=None):
+    def agent_factory(extra_tools=None, citation_validator=None):
         agent = WorkspaceAgent(
             model=model,
             tools=list(extra_tools or ()),
             monotonic_clock=lambda: 0.0,
+            citation_validator=citation_validator,
         )
         created_agents.append(agent)
         return agent
@@ -486,6 +490,7 @@ def test_cli_rag_round_trip_persists_citation_and_audits_no_body(
     assert status == 0
     assert len(created_agents) == 1
     assert "检索答案 docs/guide.md:L2-L4" in output
+    assert "[引用] 有效，引用 1，未知 0，可用资料 1" in output
     assert "[会话] 已保存：rag" in output
     assert secret_content not in output
     assert secret_content in str(snapshot)
@@ -493,3 +498,19 @@ def test_cli_rag_round_trip_persists_citation_and_audits_no_body(
     assert secret_content not in audit_text
     assert "runtime-chunk-id" not in audit_text
     assert "docs/guide.md:L2-L4" not in audit_text
+    audit_records = [
+        json.loads(line)
+        for line in audit_text.splitlines()
+    ]
+    citation_record = next(
+        record
+        for record in audit_records
+        if record["event_type"] == "CitationValidationEvent"
+    )
+    assert citation_record["data"] == {
+        "status": "valid",
+        "citation_count": 1,
+        "valid_citation_count": 1,
+        "unknown_citation_count": 0,
+        "retrieved_chunk_count": 1,
+    }

@@ -15,6 +15,7 @@ from contracts import (
     ApprovalDecision,
     ApprovalRequiredEvent,
     ApprovalResolvedEvent,
+    CitationValidationEvent,
     ContextTrimmedEvent,
     EventEnvelope,
     MemoryUpdatedEvent,
@@ -135,6 +136,27 @@ def render_event(event: AgentEvent) -> None:
         print(f"[上下文] 已移除 {event.removed_message_count} 条旧消息")
     elif isinstance(event, MemoryUpdatedEvent):
         print(f"[记忆] 长期摘要已更新，共 {event.character_count} 个字符")
+    elif isinstance(event, CitationValidationEvent):
+        if event.status == "valid":
+            print(
+                f"[引用] 有效，引用 {event.citation_count}，"
+                f"未知 {event.unknown_citation_count}，"
+                f"可用资料 {event.retrieved_chunk_count}"
+            )
+        elif event.status == "missing":
+            print(
+                "[引用] 缺少引用，"
+                f"可用资料 {event.retrieved_chunk_count}"
+            )
+        elif event.status == "unknown":
+            print(
+                "[引用] 检测到 "
+                f"{event.unknown_citation_count} 个未知引用"
+            )
+        elif event.status == "not_applicable":
+            print("[引用] 本轮未使用知识检索")
+        else:
+            print("[引用] 校验失败")
     elif isinstance(event, ModelCallMetricsEvent):
         status_label = STATUS_LABELS[event.status]
         first_chunk = (
@@ -172,6 +194,7 @@ def _ensure_line_start() -> None:
 
 def create_workspace_agent(
     extra_tools: Iterable[BaseTool] | None = None,
+    citation_validator: Callable | None = None,
 ) -> WorkspaceAgent:
     model = ChatOpenAI(
         model=os.getenv("ZHIPU_MODEL"),
@@ -192,17 +215,22 @@ def create_workspace_agent(
         tools=registered_tools,
         approval_required_tools={write_file.name},
         approval_preparers={write_file.name: prepare_write_file},
+        citation_validator=citation_validator,
     )
     return agent
 
 
 def create_workspace_agent_factory(
     extra_tools: Iterable[BaseTool],
+    citation_validator: Callable | None = None,
 ) -> Callable[[], WorkspaceAgent]:
     shared_tools = tuple(extra_tools)
 
     def agent_factory() -> WorkspaceAgent:
-        return create_workspace_agent(extra_tools=shared_tools)
+        return create_workspace_agent(
+            extra_tools=shared_tools,
+            citation_validator=citation_validator,
+        )
 
     return agent_factory
 
@@ -509,7 +537,8 @@ def main(
             if not isinstance(runtime, KnowledgeRuntime):
                 raise TypeError("invalid knowledge runtime")
             agent_factory = create_workspace_agent_factory(
-                [runtime.search_tool]
+                [runtime.search_tool],
+                citation_validator=runtime.citation_validator,
             )
         except Exception:
             print("[知识库启动失败] 无法安全初始化知识库")

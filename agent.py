@@ -21,6 +21,7 @@ from contracts import (
     ApprovalDecision,
     ApprovalRequiredEvent,
     ApprovalResolvedEvent,
+    CitationValidationEvent,
     ContextTrimmedEvent,
     MemoryUpdatedEvent,
     ModelCallMetricsEvent,
@@ -32,6 +33,7 @@ from contracts import (
     ToolCallEvent,
     ToolResultEvent,
 )
+from citations import CitationValidationResult
 
 
 SYSTEM_PROMPT = (
@@ -106,6 +108,7 @@ class WorkspaceAgent:
             dict[str, Callable[..., PreparedToolAction]] | None
         ) = None,
         monotonic_clock: Callable[[], float] | None = None,
+        citation_validator: Callable | None = None,
     ):
         configured_previewers = dict(approval_previewers or {})
         configured_preparers = dict(approval_preparers or {})
@@ -142,6 +145,11 @@ class WorkspaceAgent:
         )
         if not callable(self.monotonic_clock):
             raise TypeError("monotonic_clock 必须可调用")
+        if citation_validator is not None and not callable(
+            citation_validator
+        ):
+            raise TypeError("citation_validator 必须可调用")
+        self.citation_validator = citation_validator
         self.tools_by_name = {tool.name: tool for tool in self.tools}
         self.model_with_tools = self.model.bind_tools(self.tools)
         self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
@@ -359,6 +367,7 @@ class WorkspaceAgent:
             working_messages,
             working_summary,
         )
+        current_turn_start_index = len(working_messages) - 1
 
         state = _TurnState()
         answered = False
@@ -388,10 +397,15 @@ class WorkspaceAgent:
             working_messages.append(response)
 
             if not response.tool_calls:
+                citation_event = self._validate_current_turn_citations(
+                    working_messages[current_turn_start_index:]
+                )
                 memory_changed = working_summary != self.memory_summary
                 self.messages = working_messages
                 self.memory_summary = working_summary
                 answered = True
+                if citation_event is not None:
+                    yield citation_event
                 if memory_changed:
                     yield MemoryUpdatedEvent(
                         character_count=len(self.memory_summary),
@@ -413,6 +427,53 @@ class WorkspaceAgent:
                     f"Agent 循环达到 {self.max_agent_loops} 次上限，"
                     "已停止。"
                 )
+            )
+
+    def _validate_current_turn_citations(
+        self,
+        current_turn_messages: list,
+    ) -> CitationValidationEvent | None:
+        if self.citation_validator is None:
+            return None
+
+        try:
+            immutable_messages = tuple(deepcopy(current_turn_messages))
+            result = self.citation_validator(immutable_messages)
+            if not isinstance(result, CitationValidationResult):
+                raise TypeError(
+                    "citation_validator 必须返回 CitationValidationResult"
+                )
+            allowed_statuses = {
+                "valid",
+                "missing",
+                "unknown",
+                "not_applicable",
+            }
+            counts = (
+                result.citation_count,
+                result.valid_citation_count,
+                result.unknown_citation_count,
+                result.retrieved_chunk_count,
+            )
+            if (
+                result.status not in allowed_statuses
+                or any(type(value) is not int or value < 0 for value in counts)
+            ):
+                raise ValueError("citation_validator 返回了无效结果")
+            return CitationValidationEvent(
+                status=result.status,
+                citation_count=result.citation_count,
+                valid_citation_count=result.valid_citation_count,
+                unknown_citation_count=result.unknown_citation_count,
+                retrieved_chunk_count=result.retrieved_chunk_count,
+            )
+        except Exception:
+            return CitationValidationEvent(
+                status="error",
+                citation_count=0,
+                valid_citation_count=0,
+                unknown_citation_count=0,
+                retrieved_chunk_count=0,
             )
 
     def _trim_history(self, messages: list) -> list:
@@ -847,6 +908,7 @@ class WorkspaceAgent:
                     "请根据已有信息直接回答。"
                 ),
                 tool_call_id=tool_call_id,
+                tool_name=tool_name,
             )
             yield ToolResultEvent(
                 tool_call_id=tool_call_id,
@@ -871,6 +933,7 @@ class WorkspaceAgent:
                     "请根据已有信息回答。"
                 ),
                 tool_call_id=tool_call_id,
+                tool_name=tool_name,
             )
             yield ToolResultEvent(
                 tool_call_id=tool_call_id,
@@ -887,6 +950,7 @@ class WorkspaceAgent:
                 messages=working_messages,
                 content="重复工具调用已跳过，请使用之前相同工具调用的结果。",
                 tool_call_id=tool_call_id,
+                tool_name=tool_name,
             )
             yield ToolResultEvent(
                 tool_call_id=tool_call_id,
@@ -909,6 +973,7 @@ class WorkspaceAgent:
                     "请根据已有信息回答。"
                 ),
                 tool_call_id=tool_call_id,
+                tool_name=tool_name,
             )
             yield ToolResultEvent(
                 tool_call_id=tool_call_id,
@@ -925,6 +990,7 @@ class WorkspaceAgent:
                 messages=working_messages,
                 content=f"未知工具：{tool_name}",
                 tool_call_id=tool_call_id,
+                tool_name=tool_name,
                 state=state,
             )
             yield ToolResultEvent(
@@ -947,6 +1013,7 @@ class WorkspaceAgent:
                 messages=working_messages,
                 content=f"工具参数非法：{error}",
                 tool_call_id=tool_call_id,
+                tool_name=tool_name,
                 state=state,
             )
             yield ToolResultEvent(
@@ -987,6 +1054,7 @@ class WorkspaceAgent:
                         messages=working_messages,
                         content=preview_error,
                         tool_call_id=tool_call_id,
+                        tool_name=tool_name,
                         state=state,
                     )
                     yield ToolResultEvent(
@@ -1030,6 +1098,7 @@ class WorkspaceAgent:
                         "本次调用未执行。请根据已有信息继续回答。"
                     ),
                     tool_call_id=tool_call_id,
+                    tool_name=tool_name,
                 )
                 yield ToolResultEvent(
                     tool_call_id=tool_call_id,
@@ -1060,6 +1129,7 @@ class WorkspaceAgent:
                     "请根据最新状态重新读取或重新发起写入。"
                 ),
                 tool_call_id=tool_call_id,
+                tool_name=tool_name,
             )
             yield ToolResultEvent(
                 tool_call_id=tool_call_id,
@@ -1094,6 +1164,7 @@ class WorkspaceAgent:
             messages=working_messages,
             content=tool_result_text,
             tool_call_id=tool_call_id,
+            tool_name=tool_name,
             state=state,
         )
         yield ToolResultEvent(
@@ -1234,6 +1305,7 @@ class WorkspaceAgent:
         messages: list,
         content: str,
         tool_call_id: str,
+        tool_name: str,
         state: _TurnState,
     ) -> tuple[int, bool]:
         remaining_characters = max(
@@ -1249,6 +1321,7 @@ class WorkspaceAgent:
             ToolMessage(
                 content=limited_content,
                 tool_call_id=tool_call_id,
+                name=tool_name,
             )
         )
         character_count = len(limited_content)
@@ -1265,11 +1338,13 @@ class WorkspaceAgent:
         messages: list,
         content: str,
         tool_call_id: str,
+        tool_name: str,
     ) -> None:
         messages.append(
             ToolMessage(
                 content=content,
                 tool_call_id=tool_call_id,
+                name=tool_name,
             )
         )
 

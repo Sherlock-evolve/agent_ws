@@ -9,6 +9,7 @@ import session_store
 from contracts import (
     ApprovalRequiredEvent,
     ApprovalResolvedEvent,
+    CitationValidationEvent,
     ContextTrimmedEvent,
     EventEnvelope,
     MemoryUpdatedEvent,
@@ -173,6 +174,33 @@ class JsonlAuditLogger:
         if isinstance(event, MemoryUpdatedEvent):
             return "MemoryUpdatedEvent", {
                 "character_count": event.character_count,
+            }
+        if isinstance(event, CitationValidationEvent):
+            if event.status not in {
+                "valid",
+                "missing",
+                "unknown",
+                "not_applicable",
+                "error",
+            }:
+                raise AuditLogError("引用校验状态不在允许范围内")
+            counts = (
+                event.citation_count,
+                event.valid_citation_count,
+                event.unknown_citation_count,
+                event.retrieved_chunk_count,
+            )
+            if any(
+                type(value) is not int or value < 0
+                for value in counts
+            ):
+                raise AuditLogError("引用校验计数必须是非负整数")
+            return "CitationValidationEvent", {
+                "status": event.status,
+                "citation_count": event.citation_count,
+                "valid_citation_count": event.valid_citation_count,
+                "unknown_citation_count": event.unknown_citation_count,
+                "retrieved_chunk_count": event.retrieved_chunk_count,
             }
         if isinstance(event, ModelCallMetricsEvent):
             return "ModelCallMetricsEvent", {
